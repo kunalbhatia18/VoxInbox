@@ -3,54 +3,65 @@ import { toast } from 'react-hot-toast'
 
 interface GmailTestProps {
   ws: WebSocket | null
+  isConnected: boolean
 }
 
-export function GmailTest({ ws }: GmailTestProps) {
+export function GmailTest({ ws, isConnected }: GmailTestProps) {
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState<any>(null)
 
   const testFunction = async (funcName: string, args?: any) => {
-    if (!ws) {
-      toast.error('WebSocket not connected')
+    if (!ws || !isConnected) {
+      toast.error('WebSocket not connected or not ready')
       return
     }
 
     setLoading(true)
     setResults(null)
 
-    // Send function call
-    ws.send(JSON.stringify({
-      type: 'function_call',
-      function: funcName,
-      args: args || {}
-    }))
+    try {
+      // Send function call
+      ws.send(JSON.stringify({
+        type: 'function_call',
+        function: funcName,
+        args: args || {}
+      }))
 
-    // Listen for response
-    const handler = (event: MessageEvent) => {
-      const message = JSON.parse(event.data)
-      if (message.function === funcName) {
-        setLoading(false)
-        if (message.type === 'error') {
-          toast.error(`${message.error_code || 'Error'}: ${message.error}`)
-          setResults({ error: message.error })
-        } else {
-          toast.success(`${funcName} completed`)
-          setResults(message.result)
+      // Listen for response
+      const handler = (event: MessageEvent) => {
+        try {
+          const message = JSON.parse(event.data)
+          if (message.function === funcName) {
+            setLoading(false)
+            if (message.type === 'error') {
+              toast.error(`${message.error_code || 'Error'}: ${message.error}`)
+              setResults({ error: message.error })
+            } else {
+              toast.success(`${funcName} completed`)
+              setResults(message.result)
+            }
+            ws.removeEventListener('message', handler)
+          }
+        } catch (e) {
+          console.error('Error parsing WebSocket message:', e)
         }
+      }
+
+      ws.addEventListener('message', handler)
+
+      // Timeout after 10 seconds
+      setTimeout(() => {
         ws.removeEventListener('message', handler)
-      }
+        if (loading) {
+          setLoading(false)
+          toast.error('Request timed out')
+        }
+      }, 10000)
+    } catch (error) {
+      setLoading(false)
+      toast.error('Failed to send request')
+      console.error('WebSocket send error:', error)
     }
-
-    ws.addEventListener('message', handler)
-
-    // Timeout after 10 seconds
-    setTimeout(() => {
-      ws.removeEventListener('message', handler)
-      if (loading) {
-        setLoading(false)
-        toast.error('Request timed out')
-      }
-    }, 10000)
   }
 
   const tests = [
@@ -94,7 +105,7 @@ export function GmailTest({ ws }: GmailTestProps) {
           <button
             key={test.func}
             onClick={() => testFunction(test.func, test.args)}
-            disabled={loading || !ws}
+            disabled={loading || !isConnected}
             className="text-left px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {test.name}
