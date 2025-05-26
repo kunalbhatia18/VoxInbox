@@ -1,0 +1,33 @@
+{
+  "name": "VoiceInbox MVP",
+  "short_name": "VoiceInbox",
+  "description": "Manage Gmail with voice commands",
+  "theme_color": "#4285f4",
+  "background_color": "#ffffff",
+  "display": "standalone",
+  "orientation": "portrait",
+  "scope": "/",
+  "start_url": "/",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "New Email",
+      "url": "/?action=compose",
+      "description": "Compose a new email"
+    }
+  ]
+}
