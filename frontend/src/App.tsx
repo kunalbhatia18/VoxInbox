@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useMemo } from 'react'
 import { Toaster, toast } from 'react-hot-toast'
 import { GmailTest } from './components/GmailTest'
 import { ConnectionTest } from './components/ConnectionTest'
@@ -81,24 +81,27 @@ function App() {
     }
   })
 
-  // Audio playback hook
-  const audioPlayback = useAudioPlayback({
+  // Audio playback hook with stable callbacks
+  const audioPlayback = useMemo(() => ({
     onPlaybackStart: () => {
       console.log('🔊 AI started speaking')
       setIsAISpeaking(true)
-      toast('🤖 AI speaking...', { icon: '🔊' })
+      toast('🤖 AI speaking...', { icon: '🔊', duration: 30000 })
     },
     onPlaybackEnd: () => {
       console.log('🔊 AI finished speaking')
       setIsAISpeaking(false)
-      toast('AI finished', { icon: '✓', duration: 1000 })
+      toast.dismiss() // Clear previous toasts
+      toast.success('AI finished speaking', { icon: '✓', duration: 2000 })
     },
     onError: (error: string) => {
       console.error('Audio playback error:', error)
       toast.error(`Audio error: ${error}`)
       setIsAISpeaking(false)
     }
-  })
+  }), []) // Empty dependency array for stable callbacks
+
+  const audioPlaybackHook = useAudioPlayback(audioPlayback)
 
   // Update recording state when voice capture changes
   useEffect(() => {
@@ -106,7 +109,9 @@ function App() {
   }, [voiceCapture.isRecording])
 
   useEffect(() => {
-    console.log('🔧 App useEffect running - initializing...')
+    if (import.meta.env.DEV) {
+      console.log('🔧 App useEffect running - initializing...')
+    }
     
     // Initialize global WebSocket reference
     window.wsRef = null
@@ -116,7 +121,9 @@ function App() {
 
     // Cleanup on unmount
     return () => {
-      console.log('🧹 App useEffect cleanup running...')
+      if (import.meta.env.DEV) {
+        console.log('🧹 App useEffect cleanup running...')
+      }
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -191,14 +198,18 @@ function App() {
 
     setIsConnecting(true)
     setWsConnected(false)
-    console.log('Creating new WebSocket connection with session:', sessionId)
+    if (import.meta.env.DEV) {
+      console.log('Creating new WebSocket connection with session:', sessionId)
+    }
     
     try {
       const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`)
       wsRef.current = ws // Store reference immediately
 
       ws.onopen = () => {
-        console.log('WebSocket connected successfully')
+        if (import.meta.env.DEV) {
+          console.log('WebSocket connected successfully')
+        }
         setIsConnecting(false)
         // Only set connected if WebSocket is actually open
         if (ws.readyState === WebSocket.OPEN) {
@@ -212,44 +223,50 @@ function App() {
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data)
-          console.log('WebSocket message:', message)
+          const messageType = message.type
           
-          // Handle different message types from OpenAI Realtime API
-          if (message.type === 'response.audio.delta') {
-            // Handle audio response chunks from OpenAI
-            if (message.delta) {
-              audioPlayback.addAudioChunk(message.delta)
-              console.log('🎧 Received audio chunk from OpenAI')
+          // Only log essential messages to reduce console noise
+          if (import.meta.env.DEV && ['response.created', 'response.done', 'response.audio.done', 'system', 'error'].includes(messageType)) {
+            console.log('WebSocket message:', message)
+          }
+          
+          // Handle only essential message types from OpenAI Realtime API
+          if (messageType === 'response.created') {
+            if (import.meta.env.DEV) {
+              console.log('🚀 OpenAI response started')
             }
-          } else if (message.type === 'response.audio.done') {
-            console.log('🎧 Audio response complete')
-            audioPlayback.markStreamDone()   
-          } else if (message.type === 'response.done') {
-            console.log('✅ OpenAI response complete')
-          } else if (message.type === 'response.created') {
-            console.log('🚀 OpenAI response started')
-          } else if (message.type === 'response.output_item.added') {
-            console.log('📝 OpenAI adding output item:', message.item?.type)
-          } else if (message.type === 'response.function_call_delta') {
-            console.log('🔧 Function call in progress:', message.name)
-          } else if (message.type === 'response.text.delta') {
-            console.log('💬 Text response chunk:', message.delta)
-          } else if (message.type === 'input_audio_buffer.speech_started') {
-            console.log('🎤 OpenAI detected speech start')
-          } else if (message.type === 'input_audio_buffer.speech_stopped') {
-            console.log('🎤 OpenAI detected speech stop')
-          } else if (message.type === 'conversation.item.created') {
-            console.log('📝 Created conversation item:', message.item?.type)
-          } else if (message.type === 'system') {
+            // Clear any previous audio to ensure clean playback
+            audioPlaybackHook.clearQueue()
+            
+          } else if (messageType === 'response.audio.delta') {
+            // Handle audio response chunks from OpenAI - MOST IMPORTANT
+            if (message.delta) {
+              audioPlaybackHook.addAudioChunk(message.delta)
+              // Don't log individual chunks - too noisy
+            }
+            
+          } else if (messageType === 'response.audio.done') {
+            if (import.meta.env.DEV) {
+              console.log('🎧 Audio response complete')
+            }
+            audioPlaybackHook.markStreamDone()
+            
+          } else if (messageType === 'response.done') {
+            if (import.meta.env.DEV) {
+              console.log('✅ OpenAI response complete')
+            }
+            
+          } else if (messageType === 'system') {
             // Handle system messages (like fallback mode)
             toast(message.message, { icon: 'ℹ️' })
-          } else if (message.type === 'error' && !message.function) {
+            
+          } else if (messageType === 'error' && !message.function) {
             console.error('❌ OpenAI Error:', message.error)
             toast.error(`OpenAI Error: ${message.error?.message || 'Unknown error'}`)
           }
           
           // Handle function result messages (for testing)
-          if (message.type === 'function_result') {
+          if (messageType === 'function_result') {
             console.log('Function result:', message.function, message.result)
           }
         } catch (e) {
@@ -364,6 +381,13 @@ function App() {
       return
     }
     
+    // Prevent recording if AI is speaking
+    if (isAISpeaking) {
+      console.log('AI is speaking, cannot start recording')
+      toast.error('Please wait for AI to finish speaking')
+      return
+    }
+    
     // Prevent double-start
     if (isRecording || voiceCapture.isRecording) {
       console.log('Already recording, ignoring start request')
@@ -376,9 +400,12 @@ function App() {
       return
     }
     
+    // Stop any ongoing audio playback first
+    audioPlaybackHook.stopPlayback()
+    
     // Initialize audio playback context on user gesture (required by browsers)
     try {
-      if (!audioPlayback.isSupported) {
+      if (!audioPlaybackHook.isSupported) {
         console.log('🔊 Initializing audio playback on user gesture...')
         // This will create AudioContext after user interaction
       }

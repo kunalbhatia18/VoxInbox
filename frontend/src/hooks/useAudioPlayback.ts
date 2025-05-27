@@ -1,13 +1,9 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-// ─── Config ──────────────────────────────────────────────────────────────
-const MIN_BUFFER_BEFORE_PLAY = 0.4      // seconds to buffer before the first play
-const SILENCE_TIMEOUT        = 500      // ms to wait when queue runs dry
-
 interface UseAudioPlaybackProps {
   onPlaybackStart?: () => void
   onPlaybackEnd?: () => void
-  onError?: (msg: string) => void
+  onError?: (error: string) => void
 }
 
 export const useAudioPlayback = ({
@@ -15,181 +11,273 @@ export const useAudioPlayback = ({
   onPlaybackEnd,
   onError
 }: UseAudioPlaybackProps = {}) => {
-  const [isPlaying,   setIsPlaying]   = useState(false)
+  const [isPlaying, setIsPlaying] = useState(false)
   const [isSupported, setIsSupported] = useState(false)
-
-  // —— refs (never trigger re-render) ————————————
-  const audioContextRef        = useRef<AudioContext | null>(null)
-  const audioBufferQueueRef    = useRef<AudioBuffer[]>([])
-  const currentSourceRef       = useRef<AudioBufferSourceNode | null>(null)
-  const nextPlayTimeRef        = useRef(0)
-  const totalQueuedDurRef      = useRef(0)
-  const silenceTimerRef        = useRef<number | null>(null)
-  const streamDoneRef          = useRef(false)
-  const isPlayingRef           = useRef(false)
-
-  // ─── helpers ───────────────────────────────────────────────────────────
-  const createCtx = () =>
-    new ((window as any).AudioContext || (window as any).webkitAudioContext)({
-      sampleRate: 24_000
-    }) as AudioContext
-
-  /** Ensure we have a _live_ AudioContext (re-create if it was closed). */
-  const ensureCtx = useCallback(async (): Promise<AudioContext | null> => {
+  
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const audioBufferQueueRef = useRef<AudioBuffer[]>([])
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const nextPlayTimeRef = useRef<number>(0)
+  const isPlayingRef = useRef<boolean>(false)
+  const hasStartedRef = useRef<boolean>(false)
+  const pendingBuffersRef = useRef<number>(0)
+  const streamEndedRef = useRef<boolean>(false)
+  
+  // Initialize audio context
+  const initAudioContext = useCallback(async () => {
     try {
-      if (!audioContextRef.current || audioContextRef.current.state === 'closed')
-        audioContextRef.current = createCtx()
-      return audioContextRef.current
-    } catch (err) {
-      console.error('AudioContext init failed', err)
-      onError?.('Web-Audio init failed')
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+      
+      if (!AudioContextClass) {
+        throw new Error('Web Audio API not supported')
+      }
+      
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContextClass({
+          sampleRate: 24000 // Match OpenAI output sample rate
+        })
+      }
+      
+      // Resume context if suspended (browser autoplay policy)
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume()
+      }
+      
+      setIsSupported(true)
+      return true
+    } catch (error) {
+      console.error('Failed to initialize audio context:', error)
+      onError?.(`Audio not supported: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      setIsSupported(false)
+      return false
+    }
+  }, [onError])
+  
+  // Convert base64 PCM16 audio to AudioBuffer
+  const convertPCM16ToAudioBuffer = useCallback(async (base64Audio: string): Promise<AudioBuffer | null> => {
+    if (!audioContextRef.current) {
+      console.error('No audio context available for conversion')
+      return null
+    }
+    
+    try {
+      // Decode base64 to binary
+      const binaryString = atob(base64Audio)
+      const bytes = new Uint8Array(binaryString.length)
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i)
+      }
+      
+      // Convert to 16-bit samples
+      const samples = new Int16Array(bytes.buffer)
+      
+      // Create AudioBuffer
+      const audioBuffer = audioContextRef.current.createBuffer(
+        1, // Mono
+        samples.length,
+        24000 // Sample rate
+      )
+      
+      // Convert to float and copy to AudioBuffer
+      const channelData = audioBuffer.getChannelData(0)
+      for (let i = 0; i < samples.length; i++) {
+        channelData[i] = samples[i] / 0x7FFF // Convert from 16-bit int to float [-1, 1]
+      }
+      
+      return audioBuffer
+    } catch (error) {
+      console.error('Error converting PCM16 to AudioBuffer:', error)
+      onError?.('Error processing audio data')
       return null
     }
   }, [onError])
-
-  /** base-64 PCM-16-LE 24 kHz → AudioBuffer */
-  const b64pcmToBuffer = useCallback(
-    async (b64: string): Promise<AudioBuffer | null> => {
-      const ctx = audioContextRef.current
-      if (!ctx) return null
-      try {
-        const bin   = atob(b64)
-        const bytes = new Uint8Array(bin.length)
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-        const samples = new Int16Array(bytes.buffer)
-        const buf     = ctx.createBuffer(1, samples.length, 24_000)
-        const ch0     = buf.getChannelData(0)
-        for (let i = 0; i < samples.length; i++) ch0[i] = samples[i] / 32768
-        return buf
-      } catch (e) {
-        console.error('PCM decode failed', e)
-        onError?.('Audio decode error')
-        return null
-      }
-    },
-    [onError]
-  )
-
-  // ─── core scheduler (keeps chain warm) ─────────────────────────────────
-  const playNext = useCallback(() => {
-    const ctx = audioContextRef.current
-    if (!ctx) return
-
-    // empty queue
-    if (audioBufferQueueRef.current.length === 0) {
-      if (!streamDoneRef.current) {
-        // expect more chunks → poll later
-        if (silenceTimerRef.current === null) {
-          silenceTimerRef.current = window.setTimeout(() => {
-            silenceTimerRef.current = null
-            playNext()
-          }, SILENCE_TIMEOUT)
+  
+  // Play next audio buffer in queue
+  const playNextBuffer = useCallback(() => {
+    if (!audioContextRef.current || audioBufferQueueRef.current.length === 0) {
+      // Check if we're truly done (no pending buffers and stream ended)
+      if (pendingBuffersRef.current === 0 && hasStartedRef.current && streamEndedRef.current) {
+        if (import.meta.env.DEV) {
+          console.log('🎵 All audio buffers played, ending playback session')
         }
-        return
-      }
-      // stream finished → fire end callback
-      if (isPlayingRef.current) {
-        isPlayingRef.current = false
         setIsPlaying(false)
+        isPlayingRef.current = false
+        hasStartedRef.current = false
+        streamEndedRef.current = false
         onPlaybackEnd?.()
       }
       return
     }
-
-    // have a buffer — clear any “silence” timer
-    if (silenceTimerRef.current !== null) {
-      clearTimeout(silenceTimerRef.current)
-      silenceTimerRef.current = null
+    
+    const buffer = audioBufferQueueRef.current.shift()
+    if (!buffer) return
+    
+    pendingBuffersRef.current++
+    
+    try {
+      const source = audioContextRef.current.createBufferSource()
+      source.buffer = buffer
+      source.connect(audioContextRef.current.destination)
+      
+      // Calculate when to start playing
+      const now = audioContextRef.current.currentTime
+      const startTime = Math.max(now, nextPlayTimeRef.current)
+      
+      // Update next play time for seamless playback
+      nextPlayTimeRef.current = startTime + buffer.duration
+      
+      // Handle playback end
+      source.onended = () => {
+        currentSourceRef.current = null
+        pendingBuffersRef.current--
+        // Continue playing next buffer
+        playNextBuffer()
+      }
+      
+      currentSourceRef.current = source
+      source.start(startTime)
+      
+      // Only trigger start callback once for the entire session
+      if (!hasStartedRef.current) {
+        if (import.meta.env.DEV) {
+          console.log('🎵 Starting audio playback session')
+        }
+        setIsPlaying(true)
+        isPlayingRef.current = true
+        hasStartedRef.current = true
+        onPlaybackStart?.()
+      }
+      
+    } catch (error) {
+      console.error('Error playing audio buffer:', error)
+      pendingBuffersRef.current--
+      onError?.('Error playing audio')
     }
-
-    const buf    = audioBufferQueueRef.current.shift()!
-    const source = ctx.createBufferSource()
-    source.buffer = buf
-    source.connect(ctx.destination)
-
-    const t0 = Math.max(ctx.currentTime, nextPlayTimeRef.current)
-    nextPlayTimeRef.current = t0 + buf.duration
-
-    source.onended = () => {
-      currentSourceRef.current = null
-      playNext()
+  }, [onPlaybackStart, onPlaybackEnd, onError])
+  
+  // Add audio chunk to playback queue
+  const addAudioChunk = useCallback(async (base64Audio: string) => {
+    // Initialize and resume audio context on first use
+    if (!audioContextRef.current) {
+      const initialized = await initAudioContext()
+      if (!initialized) {
+        console.warn('Failed to initialize audio playback')
+        return
+      }
     }
-
-    currentSourceRef.current = source
-    source.start(t0)
-
-    if (!isPlayingRef.current) {
-      isPlayingRef.current = true
-      setIsPlaying(true)
-      onPlaybackStart?.()
+    
+    // Resume if suspended
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      try {
+        await audioContextRef.current.resume()
+        if (import.meta.env.DEV) {
+          console.log('🎵 Audio context resumed')
+        }
+      } catch (e) {
+        console.warn('Failed to resume audio context:', e)
+      }
     }
-  }, [onPlaybackEnd, onPlaybackStart])
-
-  // ─── public API ────────────────────────────────────────────────────────
-  const addAudioChunk = useCallback(
-    async (b64: string) => {
-      const ctx = await ensureCtx()
-      if (!ctx) return
-
-      if (ctx.state === 'suspended')
-        try { await ctx.resume() } catch {}
-
-      const buf = await b64pcmToBuffer(b64)
-      if (!buf) return
-
-      audioBufferQueueRef.current.push(buf)
-      totalQueuedDurRef.current += buf.duration
-
-      if (
-        !isPlayingRef.current &&
-        totalQueuedDurRef.current >= MIN_BUFFER_BEFORE_PLAY
-      )
-        playNext()
-    },
-    [ensureCtx, b64pcmToBuffer, playNext]
-  )
-
+    
+    // Convert and queue audio
+    const audioBuffer = await convertPCM16ToAudioBuffer(base64Audio)
+    if (audioBuffer) {
+      audioBufferQueueRef.current.push(audioBuffer)
+      // Don't log every chunk - too noisy for streaming audio
+      
+      // Start playing if not already playing
+      if (!isPlayingRef.current) {
+        playNextBuffer()
+      }
+    }
+  }, [initAudioContext, convertPCM16ToAudioBuffer, playNextBuffer])
+  
+  // Mark the audio stream as complete
   const markStreamDone = useCallback(() => {
-    streamDoneRef.current = true
-    playNext()
-  }, [playNext])
-
-  const stopPlayback = useCallback(() => {
-    currentSourceRef.current?.stop()
-    currentSourceRef.current = null
-    audioBufferQueueRef.current = []
-    totalQueuedDurRef.current   = 0
-    if (isPlayingRef.current) {
-      isPlayingRef.current = false
+    if (import.meta.env.DEV) {
+      console.log('🎵 Audio stream marked as complete')
+    }
+    streamEndedRef.current = true
+    
+    // If no buffers are pending and queue is empty, end immediately
+    if (pendingBuffersRef.current === 0 && audioBufferQueueRef.current.length === 0 && hasStartedRef.current) {
+      if (import.meta.env.DEV) {
+        console.log('🎵 No pending audio, ending playback immediately')
+      }
       setIsPlaying(false)
+      isPlayingRef.current = false
+      hasStartedRef.current = false
+      streamEndedRef.current = false
       onPlaybackEnd?.()
     }
   }, [onPlaybackEnd])
-
-  const clearQueue = useCallback(() => {
+  
+  // Stop current playback
+  const stopPlayback = useCallback(() => {
+    if (import.meta.env.DEV && isPlayingRef.current) {
+      console.log('🎵 Stopping audio playback')
+    }
+    
+    if (currentSourceRef.current) {
+      try {
+        currentSourceRef.current.stop()
+        currentSourceRef.current = null
+      } catch (error) {
+        console.warn('Error stopping audio source:', error)
+      }
+    }
+    
+    // Clear queue and reset state
     audioBufferQueueRef.current = []
-    totalQueuedDurRef.current   = 0
+    nextPlayTimeRef.current = 0
+    pendingBuffersRef.current = 0
+    hasStartedRef.current = false
+    streamEndedRef.current = false
+    
+    if (isPlayingRef.current) {
+      setIsPlaying(false)
+      isPlayingRef.current = false
+      onPlaybackEnd?.()
+    }
+  }, [onPlaybackEnd])
+  
+  // Clear playback queue
+  const clearQueue = useCallback(() => {
+    if (import.meta.env.DEV && audioBufferQueueRef.current.length > 0) {
+      console.log('🎵 Clearing audio queue')
+    }
+    audioBufferQueueRef.current = []
+    streamEndedRef.current = false
   }, [])
-
-  /** tidy up on component unmount / hot-reload */
+  
+  // Cleanup function
   const cleanup = useCallback(() => {
-    if (silenceTimerRef.current !== null) clearTimeout(silenceTimerRef.current)
+    if (import.meta.env.DEV) {
+      console.log('🎵 Cleaning up audio playback')
+    }
     stopPlayback()
-
-    const ctx = audioContextRef.current
-    // Guard: only close if still open – avoids “Cannot close a closed AudioContext”
-    if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {})
+    
+    if (audioContextRef.current) {
+      audioContextRef.current.close()
+      audioContextRef.current = null
+    }
   }, [stopPlayback])
-
-  // one-time feature-detect
+  
+  // Initialize audio support check on mount - but don't create AudioContext yet
   useEffect(() => {
-    const ok =
-      !!(window as any).AudioContext || !!(window as any).webkitAudioContext
-    setIsSupported(ok)
-    return cleanup
-  }, [cleanup])
-
-  // ─── return value ──────────────────────────────────────────────────────
+    // Only check support, don't initialize AudioContext until user gesture
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+    const supported = !!AudioContextClass
+    setIsSupported(supported)
+    
+    // Only cleanup on actual unmount, not on every render
+    return () => {
+      if (audioContextRef.current) {
+        console.log('🎵 Final cleanup on unmount')
+        cleanup()
+      }
+    }
+  }, []) // Empty deps - only run once
+  
   return {
     isPlaying,
     isSupported,

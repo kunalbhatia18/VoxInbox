@@ -66,10 +66,16 @@ export const useVoiceCapture = ({
   
   // Check browser support
   const checkSupport = useCallback(() => {
-    const supported = !!(
-      navigator.mediaDevices?.getUserMedia && 
-      (window.AudioContext || (window as any).webkitAudioContext)
-    )
+    const hasGetUserMedia =
+      typeof navigator !== 'undefined' &&
+      !!navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === 'function'
+
+    const hasAudioContext =
+      typeof window !== 'undefined' &&
+      (!!window.AudioContext || !!(window as any).webkitAudioContext)
+
+    const supported = hasGetUserMedia && hasAudioContext
     setIsSupported(supported)
     return supported
   }, [])

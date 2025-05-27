@@ -30,7 +30,7 @@ class OpenAIRealtimeProxy:
         try:
             print("🔗 Connecting to OpenAI Realtime API...")
             self.openai_ws = await websockets.connect(
-                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
                 extra_headers=headers,
                 max_size=1024*1024*16
             )
@@ -52,7 +52,10 @@ class OpenAIRealtimeProxy:
                 "instructions": (
                     "You are VoiceInbox, a helpful Gmail voice assistant. "
                     "Respond naturally and conversationally. When users ask about emails, use the available Gmail functions. "
-                    "Keep responses concise but friendly. Always confirm before taking actions like sending emails."
+                    "Keep responses concise but friendly. Always confirm before taking actions like sending emails. "
+                    "IMPORTANT: For counting questions ('how many emails', 'how many unread'), ALWAYS use count_unread_emails or get_email_counts functions. "
+                    "These return accurate counts. NEVER guess or estimate numbers. "
+                    "Use the exact numbers returned by the functions."
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -62,9 +65,9 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,
+                    "threshold": 0.6,
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                    "silence_duration_ms": 800
                 },
                 "tools": tools,
                 "tool_choice": "auto",
@@ -80,12 +83,22 @@ class OpenAIRealtimeProxy:
     
     def _create_gmail_tools(self):
         """Convert Gmail functions to OpenAI tool format"""
-        # Simplified tool set for testing - just essential functions
+        # Focused on essential functions - unread count only
         return [
             {
                 "type": "function",
+                "name": "count_unread_emails",
+                "description": "Get the accurate count of unread emails (use this for 'how many unread emails' questions)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False
+                }
+            },
+            {
+                "type": "function",
                 "name": "list_unread",
-                "description": "List the user's unread emails",
+                "description": "List actual unread email details (subjects, senders) - use when user wants to see email content",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -101,7 +114,7 @@ class OpenAIRealtimeProxy:
             {
                 "type": "function", 
                 "name": "search_messages",
-                "description": "Search the user's emails using Gmail search syntax",
+                "description": "Search emails using Gmail search syntax (use for specific queries like 'emails from John')",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -135,7 +148,9 @@ class OpenAIRealtimeProxy:
         ]:
             if self.openai_ws:
                 await self.openai_ws.send(json.dumps(message_data))
-                print(f"📤 Forwarded {message_type} to OpenAI")
+                # Only log important messages
+                if message_type in ["input_audio_buffer.commit", "response.create"]:
+                    print(f"📤 Forwarded {message_type} to OpenAI")
         
         # Legacy audio message handling (for backward compatibility)
         elif message_type == "audio":
@@ -154,16 +169,25 @@ class OpenAIRealtimeProxy:
         """Handle message from OpenAI and route to frontend or Gmail functions"""
         message_type = message_data.get("type")
         
-        # Forward all OpenAI messages to frontend for proper handling
-        if self.client_ws:
+        # Only forward essential messages to frontend to prevent flooding
+        essential_messages = {
+            'session.created', 'session.updated', 'system',
+            'response.created', 'response.done', 'error',
+            'response.audio.delta', 'response.audio.done',
+            'response.output_item.added', 'conversation.item.created',
+            'input_audio_buffer.speech_started', 'input_audio_buffer.committed'
+        }
+        
+        if message_type in essential_messages and self.client_ws:
             try:
                 await self.client_ws.send_json(message_data)
             except Exception as e:
                 print(f"⚠️ Error forwarding message to frontend: {e}")
         
-        # Handle specific message types for logging/processing
+        # Handle specific message types for processing (minimal logging)
         if message_type == "response.audio.delta":
-            print(f"🎧 Forwarded audio chunk: {len(message_data.get('delta', ''))} chars")
+            # Don't log individual audio chunks - too noisy
+            pass
         
         elif message_type == "response.created":
             print("🚀 OpenAI response started")
@@ -174,9 +198,11 @@ class OpenAIRealtimeProxy:
         elif message_type == "response.function_call_arguments.done":
             # Function call completed - execute it
             item_id = message_data.get("item_id")
-            call_id = message_data.get("call_id")  # This might be the actual call_id
+            call_id = message_data.get("call_id")
             function_name = message_data.get("name")
             function_args = message_data.get("arguments")
+            
+            print(f"🔧 Function call detected: {function_name} with args: {function_args}")
             
             if function_name and function_args is not None:
                 print(f"🔧 Executing Gmail function: {function_name}")
@@ -196,9 +222,6 @@ class OpenAIRealtimeProxy:
         
         elif message_type == "error":
             print(f"❌ OpenAI error: {message_data.get('error', {})}")
-        
-        else:
-            print(f"📨 OpenAI message: {message_type}")
     
     async def _execute_function(self, call_id: str, function_name: str, arguments: str):
         """Execute a Gmail function and send result back to OpenAI"""
@@ -216,7 +239,7 @@ class OpenAIRealtimeProxy:
                     result = await func(self.user_id, max_results)
                 
                 # Functions with no additional parameters
-                elif function_name in ['abort_current_action', 'narrow_scope_request']:
+                elif function_name in ['abort_current_action', 'narrow_scope_request', 'count_unread_emails', 'get_email_counts']:
                     result = await func(self.user_id)
                 
                 # Functions with complex args that need the full args dict
@@ -264,14 +287,14 @@ class OpenAIRealtimeProxy:
                 
                 if self.openai_ws:
                     await self.openai_ws.send(json.dumps(function_result))
-                    print(f"📤 Sent function result to OpenAI")
+                    print(f"📤 Sent function result to OpenAI: {json.dumps(result, default=str)[:100]}...")
                     
-                    # Request a voice response after function execution
+                    # Always request voice response after function execution
                     response_request = {
                         "type": "response.create",
                         "response": {
                             "modalities": ["audio", "text"],
-                            "instructions": "Summarize the email results naturally in a conversational way. Keep it brief and friendly."
+                            "instructions": "Read the function result carefully and use the EXACT numbers provided. Do not reference estimates or other numbers. Be conversational and friendly."
                         }
                     }
                     await self.openai_ws.send(json.dumps(response_request))
@@ -321,12 +344,11 @@ class OpenAIRealtimeProxy:
             while self.openai_ws:
                 message = await self.openai_ws.recv()
                 message_data = json.loads(message)
-                print(f"📨 Raw OpenAI message: {message_data.get('type', 'unknown')}")
                 
-                # Log audio delta messages specifically
-                if message_data.get('type') == 'response.audio.delta':
-                    delta_len = len(message_data.get('delta', ''))
-                    print(f"🎧 Audio delta received: {delta_len} chars")
+                # Only log essential message types to reduce noise
+                message_type = message_data.get('type', 'unknown')
+                if message_type in ['response.created', 'response.done', 'session.created', 'session.updated', 'error']:
+                    print(f"📨 OpenAI: {message_type}")
                 
                 await self.handle_openai_message(message_data)
         except websockets.exceptions.ConnectionClosed:

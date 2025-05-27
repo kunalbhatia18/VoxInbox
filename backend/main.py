@@ -628,6 +628,32 @@ async def abort_current_action(user_id: str) -> Dict:
     # In a real implementation, this would cancel ongoing operations
     return {'status': 'acknowledged', 'message': 'Operation cancelled'}
 
+async def count_unread_emails(user_id: str) -> Dict:
+    """Get accurate count of unread emails only"""
+    try:
+        service = get_gmail_service(user_id)
+        
+        # Get unread messages - use higher limit to get accurate count
+        result = service.users().messages().list(
+            userId='me',
+            q="is:unread",
+            maxResults=500
+        ).execute()
+        
+        actual_count = len(result.get('messages', []))
+        
+        return {
+            'count': actual_count,
+            'exact_count': True,
+            'clear_message': f'You have exactly {actual_count} unread email{"s" if actual_count != 1 else ""}.'
+        }
+        
+    except Exception as e:
+        return {
+            'count': 0,
+            'error': f'Failed to count unread emails: {str(e)}'
+        }
+
 async def narrow_scope_request(user_id: str) -> Dict:
     """Return clarifying question when request is too broad"""
     return {
@@ -663,6 +689,7 @@ GMAIL_FUNCTIONS_WITH_ARGS = {
     "search_messages": (search_messages, SearchMessagesArgs),
     "list_unread": (list_unread, None),
     "list_unread_priority": (list_unread_priority, None),
+    "count_unread_emails": (count_unread_emails, None),
     "get_thread": (get_thread, GetThreadArgs),
     "summarize_messages": (summarize_messages, SummarizeMessagesArgs),
     "summarize_thread": (summarize_thread, SummarizeThreadArgs),
