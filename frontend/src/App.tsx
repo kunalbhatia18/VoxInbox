@@ -3,6 +3,7 @@ import { Toaster, toast } from 'react-hot-toast'
 import { GmailTest } from './components/GmailTest'
 import { ConnectionTest } from './components/ConnectionTest'
 import { useVoiceCapture } from './hooks/useVoiceCapture'
+import { useAudioPlayback } from './hooks/useAudioPlayback'
 
 // Extend Window interface for global WebSocket reference
 declare global {
@@ -20,6 +21,7 @@ function App() {
   const [showTests, setShowTests] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
   const [authCheckInProgress, setAuthCheckInProgress] = useState(false)
+  const [isAISpeaking, setIsAISpeaking] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const connectionInitiated = useRef(false) // Prevent React StrictMode double-connections
 
@@ -34,6 +36,27 @@ function App() {
         }
         wsRef.current.send(JSON.stringify(audioMessage))
         console.log('🎤 Sent audio data to OpenAI', audioBase64.length, 'characters')
+        
+        // NOW commit the audio buffer and request response
+        const commitMessage = {
+          type: "input_audio_buffer.commit"
+        }
+        wsRef.current.send(JSON.stringify(commitMessage))
+        console.log('📱 Committed audio buffer to OpenAI')
+        
+        // Request OpenAI to generate a response
+        const responseMessage = {
+          type: "response.create",
+          response: {
+            modalities: ["text", "audio"],
+            instructions: "You are VoiceInbox, a helpful email assistant. Respond naturally and help the user with their Gmail tasks.",
+            voice: "alloy",
+            output_audio_format: "pcm16",
+            temperature: 0.6
+          }
+        }
+        wsRef.current.send(JSON.stringify(responseMessage))
+        console.log('🤖 Requested OpenAI response with audio output')
       } else {
         console.warn('WebSocket not connected, cannot send audio')
         toast.error('Connection lost - cannot send voice data')
@@ -55,6 +78,25 @@ function App() {
       } else {
         setIsRecording(false)
       }
+    }
+  })
+
+  // Audio playback hook
+  const audioPlayback = useAudioPlayback({
+    onPlaybackStart: () => {
+      console.log('🔊 AI started speaking')
+      setIsAISpeaking(true)
+      toast('🤖 AI speaking...', { icon: '🔊' })
+    },
+    onPlaybackEnd: () => {
+      console.log('🔊 AI finished speaking')
+      setIsAISpeaking(false)
+      toast('AI finished', { icon: '✓', duration: 1000 })
+    },
+    onError: (error: string) => {
+      console.error('Audio playback error:', error)
+      toast.error(`Audio error: ${error}`)
+      setIsAISpeaking(false)
     }
   })
 
@@ -172,8 +214,43 @@ function App() {
           const message = JSON.parse(event.data)
           console.log('WebSocket message:', message)
           
-          if (message.type === 'error' && !message.function) {
-            toast.error(message.error)
+          // Handle different message types from OpenAI Realtime API
+          if (message.type === 'response.audio.delta') {
+            // Handle audio response chunks from OpenAI
+            if (message.delta) {
+              audioPlayback.addAudioChunk(message.delta)
+              console.log('🎧 Received audio chunk from OpenAI')
+            }
+          } else if (message.type === 'response.audio.done') {
+            console.log('🎧 Audio response complete')
+            audioPlayback.markStreamDone()   
+          } else if (message.type === 'response.done') {
+            console.log('✅ OpenAI response complete')
+          } else if (message.type === 'response.created') {
+            console.log('🚀 OpenAI response started')
+          } else if (message.type === 'response.output_item.added') {
+            console.log('📝 OpenAI adding output item:', message.item?.type)
+          } else if (message.type === 'response.function_call_delta') {
+            console.log('🔧 Function call in progress:', message.name)
+          } else if (message.type === 'response.text.delta') {
+            console.log('💬 Text response chunk:', message.delta)
+          } else if (message.type === 'input_audio_buffer.speech_started') {
+            console.log('🎤 OpenAI detected speech start')
+          } else if (message.type === 'input_audio_buffer.speech_stopped') {
+            console.log('🎤 OpenAI detected speech stop')
+          } else if (message.type === 'conversation.item.created') {
+            console.log('📝 Created conversation item:', message.item?.type)
+          } else if (message.type === 'system') {
+            // Handle system messages (like fallback mode)
+            toast(message.message, { icon: 'ℹ️' })
+          } else if (message.type === 'error' && !message.function) {
+            console.error('❌ OpenAI Error:', message.error)
+            toast.error(`OpenAI Error: ${message.error?.message || 'Unknown error'}`)
+          }
+          
+          // Handle function result messages (for testing)
+          if (message.type === 'function_result') {
+            console.log('Function result:', message.function, message.result)
           }
         } catch (e) {
           console.error('Invalid WebSocket message', e)
@@ -287,10 +364,26 @@ function App() {
       return
     }
     
+    // Prevent double-start
+    if (isRecording || voiceCapture.isRecording) {
+      console.log('Already recording, ignoring start request')
+      return
+    }
+    
     // Check microphone support
     if (!voiceCapture.isSupported) {
       toast.error('Microphone not supported in this browser')
       return
+    }
+    
+    // Initialize audio playback context on user gesture (required by browsers)
+    try {
+      if (!audioPlayback.isSupported) {
+        console.log('🔊 Initializing audio playback on user gesture...')
+        // This will create AudioContext after user interaction
+      }
+    } catch (error) {
+      console.warn('Audio playback initialization warning:', error)
     }
     
     // Request permission if needed
@@ -312,16 +405,15 @@ function App() {
   }
 
   const handleStopRecording = () => {
-    voiceCapture.stopRecording()
-    
-    // Tell OpenAI we've finished sending audio
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      const commitMessage = {
-        type: "input_audio_buffer.commit"
-      }
-      wsRef.current.send(JSON.stringify(commitMessage))
-      console.log('📱 Committed audio buffer to OpenAI')
+    // Prevent double-stop and only stop if actually recording
+    if (!isRecording && !voiceCapture.isRecording) {
+      console.log('Not recording, ignoring stop request')
+      return
     }
+    
+    voiceCapture.stopRecording()
+    // The commit and response.create are now sent in onAudioData callback
+    // after the audio is actually processed and sent
   }
 
   if (loading) {
@@ -413,6 +505,8 @@ function App() {
                 <p className="text-gray-600 mb-8">
                   {isConnecting 
                     ? 'Connecting to Gmail service...' 
+                    : isAISpeaking
+                    ? '🤖 AI is responding... Please wait.'
                     : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
                       ? '🎤 Ready for voice commands! Press and hold to talk.'
                       : 'Connection lost - click Reconnect'
@@ -426,28 +520,61 @@ function App() {
 
                 {/* Push-to-talk button */}
                 <button
-                  onMouseDown={handleStartRecording}
-                  onMouseUp={handleStopRecording}
-                  onTouchStart={handleStartRecording}
-                  onTouchEnd={handleStopRecording}
-                  disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !voiceCapture.isSupported}
+                  onMouseDown={(e) => {
+                    e.preventDefault()
+                    handleStartRecording()
+                  }}
+                  onMouseUp={(e) => {
+                    e.preventDefault()
+                    handleStopRecording()
+                  }}
+                  onMouseLeave={(e) => {
+                    e.preventDefault()
+                    // Stop recording if mouse leaves button while held down
+                    if (isRecording || voiceCapture.isRecording) {
+                      handleStopRecording()
+                    }
+                  }}
+                  onTouchStart={(e) => {
+                    e.preventDefault()
+                    handleStartRecording()
+                  }}
+                  onTouchEnd={(e) => {
+                    e.preventDefault()
+                    handleStopRecording()
+                  }}
+                  disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !voiceCapture.isSupported || isAISpeaking}
                   className={
                     `w-32 h-32 rounded-full transition-all duration-200 ` +
                     (isRecording
                       ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
+                      : isAISpeaking
+                      ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
                       : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && voiceCapture.isSupported)
                       ? 'bg-blue-500 hover:bg-blue-600 shadow'
                       : 'bg-gray-300 cursor-not-allowed')
                   }
                 >
-                  <svg
-                    className="w-12 h-12 mx-auto text-white"
-                    fill="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-                  </svg>
+                  {isAISpeaking ? (
+                    // Speaker icon when AI is speaking
+                    <svg
+                      className="w-12 h-12 mx-auto text-white"
+                      fill="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                    </svg>
+                  ) : (
+                    // Microphone icon when ready to record
+                    <svg
+                      className="w-12 h-12 mx-auto text-white"
+                      fill="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                      <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                    </svg>
+                  )}
                 </button>
 
                 <p className="mt-4 text-xs text-gray-500">
@@ -455,6 +582,8 @@ function App() {
                     ? 'Microphone not supported in this browser'
                     : voiceCapture.permissionStatus === 'denied'
                     ? 'Microphone permission denied - please allow access'
+                    : isAISpeaking
+                    ? '🤖 AI is speaking - please wait for response to finish'
                     : isRecording 
                     ? '🎤 Listening... Release to stop'
                     : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN)

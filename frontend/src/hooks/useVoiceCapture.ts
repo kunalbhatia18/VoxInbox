@@ -1,89 +1,45 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-// Audio conversion utilities
-const convertToBase64 = (buffer: ArrayBuffer): string => {
-  const bytes = new Uint8Array(buffer)
+// Convert Float32Array to Int16Array for PCM16 format
+const floatTo16BitPCM = (float32Array: Float32Array): Int16Array => {
+  const int16Array = new Int16Array(float32Array.length)
+  for (let i = 0; i < float32Array.length; i++) {
+    // Convert float (-1 to 1) to 16-bit int (-32768 to 32767)
+    const s = Math.max(-1, Math.min(1, float32Array[i]))
+    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+  }
+  return int16Array
+}
+
+// Convert Int16Array to base64 string
+const int16ArrayToBase64 = (int16Array: Int16Array): string => {
+  const uint8Array = new Uint8Array(int16Array.buffer)
   let binary = ''
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i])
+  for (let i = 0; i < uint8Array.length; i++) {
+    binary += String.fromCharCode(uint8Array[i])
   }
   return btoa(binary)
 }
 
-// Convert audio to PCM16 format for OpenAI Realtime API
-const convertToPCM16 = async (audioBuffer: ArrayBuffer): Promise<string> => {
-  // Create audio context with fallback sample rates
-  const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+// Resample audio from source rate to target rate
+const resampleAudio = (audioData: Float32Array, sourceRate: number, targetRate: number): Float32Array => {
+  if (sourceRate === targetRate) return audioData
   
-  let audioContext: AudioContext
-  try {
-    // Try 24kHz first (OpenAI preference)
-    audioContext = new AudioContextClass({ sampleRate: 24000 })
-  } catch {
-    try {
-      // Fallback to 44.1kHz
-      audioContext = new AudioContextClass({ sampleRate: 44100 })
-    } catch {
-      // Use default sample rate
-      audioContext = new AudioContextClass()
-    }
-  }
-  
-  try {
-    // Decode the audio data
-    const decodedData = await audioContext.decodeAudioData(audioBuffer.slice(0))
-    
-    // Get the first channel (mono)
-    const channelData = decodedData.getChannelData(0)
-    
-    // Resample to 24kHz if necessary
-    let resampledData = channelData
-    if (audioContext.sampleRate !== 24000) {
-      resampledData = resampleAudio(channelData, audioContext.sampleRate, 24000)
-    }
-    
-    // Convert to 16-bit PCM
-    const pcm16 = new Int16Array(resampledData.length)
-    for (let i = 0; i < resampledData.length; i++) {
-      // Convert from [-1, 1] float to 16-bit integer
-      const sample = Math.max(-1, Math.min(1, resampledData[i]))
-      pcm16[i] = sample * 0x7FFF
-    }
-    
-    // Convert to base64
-    return convertToBase64(pcm16.buffer)
-  } catch (error) {
-    console.error('Error converting audio to PCM16:', error)
-    throw new Error(`Audio conversion failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
-  } finally {
-    audioContext.close()
-  }
-}
-
-// Simple resampling function
-const resampleAudio = (inputData: Float32Array, inputSampleRate: number, outputSampleRate: number): Float32Array => {
-  if (inputSampleRate === outputSampleRate) {
-    return inputData
-  }
-  
-  const ratio = inputSampleRate / outputSampleRate
-  const outputLength = Math.floor(inputData.length / ratio)
-  const outputData = new Float32Array(outputLength)
+  const ratio = sourceRate / targetRate
+  const outputLength = Math.floor(audioData.length / ratio)
+  const output = new Float32Array(outputLength)
   
   for (let i = 0; i < outputLength; i++) {
-    const inputIndex = i * ratio
-    const inputIndexFloor = Math.floor(inputIndex)
-    const inputIndexCeil = Math.ceil(inputIndex)
+    const sourceIndex = i * ratio
+    const sourceIndexFloor = Math.floor(sourceIndex)
+    const sourceIndexCeil = Math.min(sourceIndexFloor + 1, audioData.length - 1)
+    const fraction = sourceIndex - sourceIndexFloor
     
-    if (inputIndexCeil >= inputData.length) {
-      outputData[i] = inputData[inputData.length - 1]
-    } else {
-      const fraction = inputIndex - inputIndexFloor
-      outputData[i] = inputData[inputIndexFloor] * (1 - fraction) + inputData[inputIndexCeil] * fraction
-    }
+    output[i] = audioData[sourceIndexFloor] * (1 - fraction) + 
+                audioData[sourceIndexCeil] * fraction
   }
   
-  return outputData
+  return output
 }
 
 interface UseVoiceCaptureProps {
@@ -98,27 +54,24 @@ export const useVoiceCapture = ({
   onStatusChange
 }: UseVoiceCaptureProps = {}) => {
   const [isRecording, setIsRecording] = useState(false)
-  const [isSupported, setIsSupported] = useState(false) // Initialize as false, check on mount
+  const [isSupported, setIsSupported] = useState(false)
   const [permissionStatus, setPermissionStatus] = useState<'granted' | 'denied' | 'prompt'>('prompt')
   
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<Blob[]>([])
-  const streamRef = useRef<MediaStream | null>(null)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null)
+  const audioBufferRef = useRef<Float32Array[]>([])
+  const isProcessingRef = useRef(false)
   
-  // Check if browser supports required APIs
+  // Check browser support
   const checkSupport = useCallback(() => {
-    try {
-      const supported = !!(navigator.mediaDevices && 
-                          typeof navigator.mediaDevices.getUserMedia === 'function' && 
-                          window.MediaRecorder &&
-                          (window.AudioContext || (window as any).webkitAudioContext))
-      setIsSupported(supported)
-      return supported
-    } catch (error) {
-      console.warn('Browser API check failed:', error)
-      setIsSupported(false)
-      return false
-    }
+    const supported = !!(
+      navigator.mediaDevices?.getUserMedia && 
+      (window.AudioContext || (window as any).webkitAudioContext)
+    )
+    setIsSupported(supported)
+    return supported
   }, [])
   
   // Request microphone permission
@@ -129,19 +82,16 @@ export const useVoiceCapture = ({
     }
     
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
-          sampleRate: 24000, // Preferred sample rate for OpenAI
-          channelCount: 1,   // Mono audio
+          channelCount: 1,
+          sampleRate: 24000,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
         }
       })
-      
-      // Stop the stream immediately - we just wanted to check permission
       stream.getTracks().forEach(track => track.stop())
-      
       setPermissionStatus('granted')
       return true
     } catch (error) {
@@ -154,138 +104,178 @@ export const useVoiceCapture = ({
   
   // Start recording
   const startRecording = useCallback(async () => {
-    if (isRecording) return
+    if (isRecording || isProcessingRef.current) {
+      console.log('Already recording or processing')
+      return
+    }
     
-    if (permissionStatus !== 'granted') {
+    if (permissionStatus === 'denied') {
+      onError?.('Microphone permission denied')
+      return
+    }
+    
+    if (permissionStatus === 'prompt') {
       const granted = await requestPermission()
       if (!granted) return
     }
     
     try {
       onStatusChange?.('recording')
+      isProcessingRef.current = true
       
-      // Get media stream
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 24000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      })
-      
-      streamRef.current = stream
-      
-      // Create MediaRecorder with fallback mimeTypes
-      let mediaRecorder: MediaRecorder
-      const mimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/mp4',
-        'audio/ogg;codecs=opus',
-        'audio/wav'
-      ]
-      
-      let supportedMimeType = ''
-      for (const mimeType of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mimeType)) {
-          supportedMimeType = mimeType
-          break
-        }
+      // Get user media with fallback options
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 24000,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        })
+      } catch (e) {
+        console.warn('Failed with ideal constraints, trying fallback')
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       }
       
-      if (supportedMimeType) {
-        mediaRecorder = new MediaRecorder(stream, { mimeType: supportedMimeType })
-      } else {
-        // Fallback to default
-        mediaRecorder = new MediaRecorder(stream)
-      }
+      mediaStreamRef.current = stream
       
-      mediaRecorderRef.current = mediaRecorder
-      audioChunksRef.current = []
+      // Create audio context
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+      const audioContext = new AudioContextClass()
+      audioContextRef.current = audioContext
       
-      // Handle audio data
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data)
-        }
-      }
+      // Create nodes
+      const source = audioContext.createMediaStreamSource(stream)
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
       
-      // Handle recording stop
-      mediaRecorder.onstop = async () => {
-        onStatusChange?.('processing')
+      sourceNodeRef.current = source
+      processorNodeRef.current = processor
+      
+      // Clear previous buffer
+      audioBufferRef.current = []
+      
+      // Set up audio processing
+      processor.onaudioprocess = (e) => {
+        if (!isProcessingRef.current) return
         
-        try {
-          // Combine all audio chunks
-          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-          
-          // Convert to ArrayBuffer
-          const arrayBuffer = await audioBlob.arrayBuffer()
-          
-          // Convert to PCM16 format for OpenAI
-          const pcm16Base64 = await convertToPCM16(arrayBuffer)
-          
-          // Send to callback
-          onAudioData?.(pcm16Base64)
-          
-        } catch (error) {
-          console.error('Error processing audio:', error)
-          onError?.('Error processing audio')
-        } finally {
-          onStatusChange?.('idle')
-        }
+        const inputData = e.inputBuffer.getChannelData(0)
+        const buffer = new Float32Array(inputData.length)
+        buffer.set(inputData)
+        audioBufferRef.current.push(buffer)
       }
       
-      // Start recording
-      mediaRecorder.start(100) // Collect data every 100ms
-      setIsRecording(true)
+      // Connect nodes
+      source.connect(processor)
+      processor.connect(audioContext.destination)
       
-      console.log('🎤 Voice recording started')
+      // Resume context if needed
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume()
+      }
+      
+      setIsRecording(true)
+      console.log('🎤 Recording started')
       
     } catch (error) {
       console.error('Error starting recording:', error)
-      onError?.('Error starting recording')
+      onError?.(`Failed to start recording: ${error}`)
       onStatusChange?.('idle')
+      isProcessingRef.current = false
+      cleanup()
     }
-  }, [isRecording, permissionStatus, requestPermission, onAudioData, onError, onStatusChange])
+  }, [isRecording, permissionStatus, requestPermission, onError, onStatusChange])
   
   // Stop recording
   const stopRecording = useCallback(() => {
-    if (!isRecording) return
+    if (!isRecording || !isProcessingRef.current) {
+      console.log('Not recording')
+      return
+    }
+    
+    isProcessingRef.current = false
+    setIsRecording(false)
+    onStatusChange?.('processing')
     
     try {
-      // Stop MediaRecorder
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop()
+      // Disconnect nodes
+      if (sourceNodeRef.current && processorNodeRef.current) {
+        sourceNodeRef.current.disconnect()
+        processorNodeRef.current.disconnect()
       }
       
-      // Stop media stream
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop())
-        streamRef.current = null
+      // Process audio
+      if (audioBufferRef.current.length > 0) {
+        const sampleRate = audioContextRef.current?.sampleRate || 48000
+        
+        // Combine all buffers
+        const totalLength = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0)
+        const combined = new Float32Array(totalLength)
+        let offset = 0
+        
+        for (const buffer of audioBufferRef.current) {
+          combined.set(buffer, offset)
+          offset += buffer.length
+        }
+        
+        // Resample to 24kHz if needed
+        const resampled = resampleAudio(combined, sampleRate, 24000)
+        
+        // Convert to PCM16
+        const pcm16 = floatTo16BitPCM(resampled)
+        
+        // Convert to base64
+        const base64 = int16ArrayToBase64(pcm16)
+        
+        console.log(`🎤 Processed ${resampled.length} samples → ${base64.length} base64 chars`)
+        
+        // Send the audio data
+        onAudioData?.(base64)
+      } else {
+        console.warn('No audio data captured')
+        onError?.('No audio data captured')
       }
-      
-      setIsRecording(false)
-      console.log('🎤 Voice recording stopped')
       
     } catch (error) {
-      console.error('Error stopping recording:', error)
-      onError?.('Error stopping recording')
+      console.error('Error processing audio:', error)
+      onError?.(`Failed to process audio: ${error}`)
+    } finally {
+      cleanup()
+      onStatusChange?.('idle')
+      console.log('🎤 Recording stopped')
     }
-  }, [isRecording, onError])
+  }, [isRecording, onAudioData, onError, onStatusChange])
   
-  // Cleanup function
+  // Cleanup resources
   const cleanup = useCallback(() => {
-    stopRecording()
-    mediaRecorderRef.current = null
-    audioChunksRef.current = []
-  }, [stopRecording])
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop())
+      mediaStreamRef.current = null
+    }
+    
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close()
+      audioContextRef.current = null
+    }
+    
+    sourceNodeRef.current = null
+    processorNodeRef.current = null
+    audioBufferRef.current = []
+  }, [])
   
-  // Initialize support check on mount
+  // Check support on mount
   useEffect(() => {
     checkSupport()
-  }, [checkSupport])
+    
+    return () => {
+      if (isProcessingRef.current) {
+        isProcessingRef.current = false
+        cleanup()
+      }
+    }
+  }, [checkSupport, cleanup])
   
   return {
     isRecording,

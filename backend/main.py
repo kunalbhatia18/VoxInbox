@@ -658,8 +658,8 @@ def extract_body(payload: Dict) -> str:
     
     return body
 
-# Function mapping for WebSocket
-GMAIL_FUNCTIONS = {
+# Function mapping for WebSocket - extract only the functions for realtime proxy
+GMAIL_FUNCTIONS_WITH_ARGS = {
     "search_messages": (search_messages, SearchMessagesArgs),
     "list_unread": (list_unread, None),
     "list_unread_priority": (list_unread_priority, None),
@@ -677,6 +677,9 @@ GMAIL_FUNCTIONS = {
     "abort_current_action": (abort_current_action, None),
     "narrow_scope_request": (narrow_scope_request, None)
 }
+
+# Extract just the functions for the realtime proxy
+GMAIL_FUNCTIONS = {name: func for name, (func, _) in GMAIL_FUNCTIONS_WITH_ARGS.items()}
 
 # Routes
 @app.get("/")
@@ -907,9 +910,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 async def handle_direct_function_call(websocket: WebSocket, user_id: str, message: Dict):
     """Handle direct function calls (for backward compatibility and testing)"""
     func_name = message.get("function")
-    if func_name in GMAIL_FUNCTIONS:
+    if func_name in GMAIL_FUNCTIONS_WITH_ARGS:
         try:
-            func, args_model = GMAIL_FUNCTIONS[func_name]
+            func, args_model = GMAIL_FUNCTIONS_WITH_ARGS[func_name]
             
             # Parse arguments if needed
             if args_model:
@@ -957,10 +960,10 @@ async def test_function(function_name: str, request: Request):
     """Test Gmail functions via HTTP (for debugging)"""
     user_id = get_current_user(request)
     
-    if function_name not in GMAIL_FUNCTIONS:
+    if function_name not in GMAIL_FUNCTIONS_WITH_ARGS:
         raise HTTPException(status_code=404, detail=f"Function {function_name} not found")
     
-    func, args_model = GMAIL_FUNCTIONS[function_name]
+    func, args_model = GMAIL_FUNCTIONS_WITH_ARGS[function_name]
     body = await request.json() if args_model else {}
     
     try:
