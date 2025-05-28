@@ -28,6 +28,13 @@ function App() {
   // Voice capture hook
   const voiceCapture = useVoiceCapture({
     onAudioData: (audioBase64: string) => {
+      // Check if we actually have audio data before sending
+      if (!audioBase64 || audioBase64.length < 1000) {
+        console.warn('⚠️ Audio buffer too small, skipping send:', audioBase64.length)
+        toast.error('Please speak longer - audio too short')
+        return
+      }
+      
       // Send audio to OpenAI via WebSocket
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const audioMessage = {

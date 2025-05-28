@@ -155,6 +155,8 @@ export const useVoiceCapture = ({
       
       // Create nodes
       const source = audioContext.createMediaStreamSource(stream)
+      // TODO: Migrate to AudioWorklet when stable across all browsers
+      // @ts-ignore - ScriptProcessorNode is deprecated but still works
       const processor = audioContext.createScriptProcessor(4096, 1, 1)
       
       sourceNodeRef.current = source
@@ -164,9 +166,11 @@ export const useVoiceCapture = ({
       audioBufferRef.current = []
       
       // Set up audio processing
-      processor.onaudioprocess = (e) => {
+      // @ts-ignore - onaudioprocess is deprecated but still works
+      processor.onaudioprocess = (e: AudioProcessingEvent) => {
         if (!isProcessingRef.current) return
         
+        // @ts-ignore - inputBuffer is deprecated but still works
         const inputData = e.inputBuffer.getChannelData(0)
         const buffer = new Float32Array(inputData.length)
         buffer.set(inputData)

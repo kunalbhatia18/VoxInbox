@@ -68,7 +68,7 @@ class OpenAIRealtimeProxy:
                 "tools": tools,
                 "tool_choice": "auto",
                 "temperature": 0.6,  # Minimum allowed by OpenAI Realtime API
-                "max_response_output_tokens": 500  # Balanced default, overridden per function
+                "max_response_output_tokens": 150  # Reduced for cost savings
             }
         }
         
@@ -79,7 +79,7 @@ class OpenAIRealtimeProxy:
     
     def _create_gmail_tools(self):
         """Convert Gmail functions to OpenAI tool format"""
-        # Expanded functions for better email management
+        # Focused on essential functions - unread count only
         return [
             {
                 "type": "function",
@@ -110,90 +110,21 @@ class OpenAIRealtimeProxy:
             {
                 "type": "function", 
                 "name": "search_messages",
-                "description": "Search emails using Gmail search syntax. For important emails, try multiple strategies: 'is:starred' (user-starred), 'from:boss@company.com' (from specific important people), 'subject:urgent OR subject:important' (urgent content), or 'label:important' (Gmail's auto-importance). You can also search by sender names.",
+                "description": "Search emails using Gmail search syntax (use for specific queries like 'emails from John')",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Gmail search query. Examples: 'from:john urgent', 'is:starred', 'label:important', 'subject:invoice'"
+                            "description": "Gmail search query (e.g., 'from:john urgent', 'is:important')"
                         },
                         "max_results": {
                             "type": "integer", 
                             "description": "Maximum number of results to return",
-                            "default": 5
+                            "default": 10
                         }
                     },
                     "required": ["query"],
-                    "additionalProperties": False
-                }
-            },
-            {
-                "type": "function",
-                "name": "create_draft",
-                "description": "Create or send email drafts. Use this when user asks to draft, compose, write, or send emails",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "to": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Recipient email addresses"
-                        },
-                        "subject": {
-                            "type": "string",
-                            "description": "Email subject line"
-                        },
-                        "body_markdown": {
-                            "type": "string",
-                            "description": "Email body content (can include markdown)"
-                        },
-                        "send": {
-                            "type": "boolean",
-                            "description": "Whether to send immediately (true) or just create draft (false)",
-                            "default": False
-                        },
-                        "cc": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "CC recipients",
-                            "default": []
-                        }
-                    },
-                    "required": ["to", "subject", "body_markdown"],
-                    "additionalProperties": False
-                }
-            },
-            {
-                "type": "function",
-                "name": "mark_read",
-                "description": "Mark emails as read. Use when user says 'mark as read' or wants to clear unread status",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "msg_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of message IDs to mark as read"
-                        }
-                    },
-                    "required": ["msg_ids"],
-                    "additionalProperties": False
-                }
-            },
-            {
-                "type": "function",
-                "name": "categorize_unread",
-                "description": "Categorize and analyze unread emails by urgency and type. Use for email organization questions",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum number of emails to analyze",
-                            "default": 20
-                        }
-                    },
                     "additionalProperties": False
                 }
             }
@@ -251,24 +182,14 @@ class OpenAIRealtimeProxy:
         
         # Handle specific message types for processing (minimal logging)
         if message_type == "response.audio.delta":
-            # Monitor audio stream health occasionally
-            if hasattr(self, '_audio_chunk_count'):
-                self._audio_chunk_count += 1
-            else:
-                self._audio_chunk_count = 1
-                print("🎵 Audio streaming started")
-            
-            # Log every 20th chunk to monitor stream health without spam
-            if self._audio_chunk_count % 20 == 0:
-                print(f"🎵 Audio chunk #{self._audio_chunk_count} - stream healthy")
+            # Don't log individual audio chunks - too noisy
+            pass
         
         elif message_type == "response.created":
-            # Reset audio chunk counter for new response
-            self._audio_chunk_count = 0
-            pass  # Logging handled in _listen_to_openai
+            print("🚀 OpenAI response started")
         
         elif message_type == "response.done":
-            pass  # Logging handled in _listen_to_openai
+            print("✅ OpenAI response completed")
         
         elif message_type == "response.function_call_arguments.done":
             # Function call completed - execute it
@@ -284,9 +205,9 @@ class OpenAIRealtimeProxy:
                 await self._execute_function(call_id or item_id, function_name, function_args)
         
         elif message_type in ["session.created", "session.updated"]:
+            print(f"✅ OpenAI session: {message_type}")
             # Send confirmation to frontend that session is ready
             if self.client_ws and message_type == "session.updated":
-                print("✅ OpenAI session ready")
                 try:
                     await self.client_ws.send_json({
                         "type": "system",
@@ -316,12 +237,6 @@ class OpenAIRealtimeProxy:
                 # Functions with no additional parameters
                 elif function_name in ['abort_current_action', 'narrow_scope_request', 'count_unread_emails', 'get_email_counts']:
                     result = await func(self.user_id)
-                
-                # Functions with simple parameters (like max_results)
-                elif function_name in ['categorize_unread']:
-                    from main import CategorizeUnreadArgs
-                    max_results = args.get('max_results', 20)
-                    result = await func(self.user_id, CategorizeUnreadArgs(max_results=max_results))
                 
                 # Functions with complex args that need the full args dict
                 else:
@@ -356,31 +271,13 @@ class OpenAIRealtimeProxy:
                         # Fallback - just pass args as is
                         result = await func(self.user_id, args)
                 
-                # Limit result size for OpenAI to prevent audio generation issues
-                result_str = json.dumps(result, default=str)
-                if len(result_str) > 4000:  # Limit to 4KB for audio responses
-                    # Truncate large results intelligently
-                    if isinstance(result, dict) and 'messages' in result:
-                        # For email search results, limit message content
-                        truncated_result = result.copy()
-                        if 'messages' in truncated_result:
-                            for msg in truncated_result['messages']:
-                                if 'body' in msg and len(msg['body']) > 500:
-                                    msg['body'] = msg['body'][:500] + '... (truncated)'
-                                if 'snippet' in msg and len(msg['snippet']) > 200:
-                                    msg['snippet'] = msg['snippet'][:200] + '...'
-                        result_str = json.dumps(truncated_result, default=str)
-                    else:
-                        result_str = result_str[:4000] + '... (truncated)'
-                    print(f"⚠️ Truncated large result for {function_name}: {len(json.dumps(result, default=str))} -> {len(result_str)} chars")
-                
                 # Send result back to OpenAI
                 function_result = {
                     "type": "conversation.item.create",
                     "item": {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": result_str
+                        "output": json.dumps(result, default=str)
                     }
                 }
                 
@@ -388,36 +285,16 @@ class OpenAIRealtimeProxy:
                     await self.openai_ws.send(json.dumps(function_result))
                     print(f"📤 Sent function result to OpenAI: {json.dumps(result, default=str)[:100]}...")
                     
-                    # Cost-optimized token limits - reduced to save money while maintaining functionality
-                    short_functions = ['count_unread_emails', 'mark_read', 'abort_current_action']
-                    medium_functions = ['list_unread', 'list_unread_priority', 'search_messages']
-                    long_functions = ['summarize_messages', 'summarize_thread', 'get_thread', 'categorize_unread', 'create_draft']
-                    
-                    if function_name in short_functions:
-                        max_tokens = 50  # Reduced from 100 to save costs
-                        instructions = "Answer in 5-8 words maximum."
-                    elif function_name in medium_functions:
-                        max_tokens = 150  # Reduced from 300 to save costs  
-                        instructions = "List key results briefly. 1-2 sentences max."
-                    elif function_name in long_functions:
-                        max_tokens = 400  # Reduced from 800 to save costs
-                        instructions = "Provide concise summary. Keep under 3 sentences."
-                    else:
-                        max_tokens = 100  # Default reduced
-                        instructions = "Brief natural response."
-                    
-                    print(f"💬 Using {max_tokens} token limit for {function_name}")
-                    
-                    # Request voice response after function execution
-                    # This creates a second response, which is expected behavior
+                    # Always request voice response after function execution
                     response_request = {
                         "type": "response.create",
                         "response": {
                             "modalities": ["text", "audio"],
-                            "instructions": instructions
+                            "instructions": "Respond concisely with the function result. Keep it under 10 words."
                         }
                     }
                     await self.openai_ws.send(json.dumps(response_request))
+                    print("🎤 Requested voice response for function result")
             else:
                 print(f"⚠️ Unknown function: {function_name}")
                 
@@ -466,18 +343,8 @@ class OpenAIRealtimeProxy:
                 
                 # Only log essential message types to reduce noise
                 message_type = message_data.get('type', 'unknown')
-                if message_type == 'error':
-                    print(f"❌ OpenAI error: {message_type}")
-                elif message_type == 'response.created':
-                    # Check if it's a function call response
-                    response = message_data.get('response', {})
-                    if response.get('output', []):
-                        print("🎤 Creating voice response...")
-                elif message_type == 'response.done':
-                    # Only log if it's the final voice response
-                    response = message_data.get('response', {})
-                    if any(item.get('type') == 'message' for item in response.get('output', [])):
-                        print("✅ Voice response completed")
+                if message_type in ['response.created', 'response.done', 'session.created', 'session.updated', 'error']:
+                    print(f"📨 OpenAI: {message_type}")
                 
                 await self.handle_openai_message(message_data)
         except websockets.exceptions.ConnectionClosed:

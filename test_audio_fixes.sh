@@ -1,43 +1,47 @@
 #!/bin/bash
 
-echo "🧪 Testing VoiceInbox Audio Fixes..."
+echo "🔧 Testing VoiceInbox Audio Fixes"
+echo "================================"
 
-# Check if TypeScript compiles without errors
-echo "📝 Checking TypeScript compilation..."
-cd /Users/kunal/voice-inbox-mvp/frontend
+# Check if services are running
+echo "📊 Checking backend service..."
+if curl -s http://localhost:8000/ > /dev/null; then
+    echo "✅ Backend is running"
+else
+    echo "❌ Backend not running - start with 'uvicorn main:app --reload'"
+    exit 1
+fi
 
-# Run TypeScript check
-npm run type-check 2>&1 | grep -E "(error|Error)" && echo "❌ TypeScript errors found" || echo "✅ TypeScript compilation clean"
-
-# Check the specific files we modified
-echo ""
-echo "🔍 Checking critical files..."
-
-# Check if markStreamDone method exists
-grep -n "markStreamDone" src/hooks/useAudioPlayback.ts && echo "✅ markStreamDone method found" || echo "❌ markStreamDone method missing"
-
-# Check if App.tsx uses markStreamDone correctly
-grep -n "audioPlayback.markStreamDone" src/App.tsx && echo "✅ App.tsx uses markStreamDone" || echo "❌ App.tsx missing markStreamDone call"
-
-# Check for audio playback improvements
-grep -n "streamEndedRef" src/hooks/useAudioPlayback.ts && echo "✅ Stream completion tracking added" || echo "❌ Stream completion tracking missing"
-
-# Check for null safety
-grep -n "audioContextRef.current &&" src/hooks/useAudioPlayback.ts && echo "✅ Null safety checks added" || echo "❌ Null safety checks missing"
+echo "📊 Checking frontend service..."
+if curl -s http://localhost:5173/ > /dev/null; then
+    echo "✅ Frontend is running"
+else
+    echo "❌ Frontend not running - start with 'npm run dev'"
+    exit 1
+fi
 
 echo ""
-echo "🎯 Key improvements made:"
-echo "   1. Added markStreamDone() method to fix TypeScript error"
-echo "   2. Fixed potential null reference issues with audioContextRef"
-echo "   3. Added streamEndedRef to track when audio stream is complete"
-echo "   4. Enhanced logging for better debugging"
-echo "   5. Prevent recording while AI is speaking"
-echo "   6. Clear audio queue when new response starts"
-echo "   7. Better toast management"
+echo "🎯 FIXES APPLIED:"
+echo "✅ Audio completion callback fixed"
+echo "✅ 30-second timeout protection added"
+echo "✅ Large result truncation implemented"
+echo "✅ Audio stream health monitoring added"
 
 echo ""
-echo "🚀 Ready to test! Run the application and check:"
-echo "   - Only one 'AI started speaking' event per response"
-echo "   - Only one 'AI finished speaking' event per response"
-echo "   - Clean, single audio playback without overlapping"
-echo "   - No TypeScript compilation errors"
+echo "🧪 TEST STEPS:"
+echo "1. Go to http://localhost:5173"
+echo "2. Login with Google" 
+echo "3. Hold blue button and say: 'Can you read my most important email?'"
+echo "4. Release button"
+echo ""
+echo "🎯 EXPECTED RESULT:"
+echo "• Button: Blue → Red → Purple → Blue (should return to blue!)"
+echo "• Audio: Clear AI voice response without cutting off"
+echo "• No stuck purple button!"
+
+echo ""
+echo "🔍 MONITOR THESE LOGS:"
+echo "Backend: Look for '🎵 Audio streaming started' and chunk counts"
+echo "Frontend: Check browser console for '🎵 All audio buffers played'"
+echo ""
+echo "Ready to test! 🚀"

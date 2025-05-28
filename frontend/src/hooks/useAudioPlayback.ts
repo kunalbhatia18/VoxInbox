@@ -22,6 +22,7 @@ export const useAudioPlayback = ({
   const hasStartedRef = useRef<boolean>(false)
   const pendingBuffersRef = useRef<number>(0)
   const streamEndedRef = useRef<boolean>(false)
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null)
   
   // Initialize audio context
   const initAudioContext = useCallback(async () => {
@@ -95,17 +96,24 @@ export const useAudioPlayback = ({
   // Play next audio buffer in queue
   const playNextBuffer = useCallback(() => {
     if (!audioContextRef.current || audioBufferQueueRef.current.length === 0) {
-      // Check if we're truly done (no pending buffers and stream ended)
-      if (pendingBuffersRef.current === 0 && hasStartedRef.current && streamEndedRef.current) {
-        if (import.meta.env.DEV) {
-          console.log('🎵 All audio buffers played, ending playback session')
+      // Add a small delay before checking if truly done to ensure all audio plays
+      setTimeout(() => {
+        if (pendingBuffersRef.current === 0 && audioBufferQueueRef.current.length === 0 && hasStartedRef.current && streamEndedRef.current) {
+          if (import.meta.env.DEV) {
+            console.log('🎵 All audio buffers played, ending playback session')
+          }
+          // Clear timeout
+          if (timeoutRef.current) {
+            clearTimeout(timeoutRef.current)
+            timeoutRef.current = null
+          }
+          setIsPlaying(false)
+          isPlayingRef.current = false
+          hasStartedRef.current = false
+          streamEndedRef.current = false
+          onPlaybackEnd?.()
         }
-        setIsPlaying(false)
-        isPlayingRef.current = false
-        hasStartedRef.current = false
-        streamEndedRef.current = false
-        onPlaybackEnd?.()
-      }
+      }, 100) // 100ms delay to ensure audio completion
       return
     }
     
@@ -146,6 +154,17 @@ export const useAudioPlayback = ({
         isPlayingRef.current = true
         hasStartedRef.current = true
         onPlaybackStart?.()
+        
+        // Set timeout to prevent stuck audio (30 seconds max)
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current)
+        }
+        timeoutRef.current = setTimeout(() => {
+          if (isPlayingRef.current) {
+            console.warn('🚨 Audio playback timeout - forcing reset')
+            stopPlayback()
+          }
+        }, 30000) // 30 second timeout
       }
       
     } catch (error) {
@@ -203,6 +222,11 @@ export const useAudioPlayback = ({
       if (import.meta.env.DEV) {
         console.log('🎵 No pending audio, ending playback immediately')
       }
+      // Clear timeout
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+        timeoutRef.current = null
+      }
       setIsPlaying(false)
       isPlayingRef.current = false
       hasStartedRef.current = false
@@ -224,6 +248,12 @@ export const useAudioPlayback = ({
       } catch (error) {
         console.warn('Error stopping audio source:', error)
       }
+    }
+    
+    // Clear timeout
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current)
+      timeoutRef.current = null
     }
     
     // Clear queue and reset state
