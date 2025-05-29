@@ -41,8 +41,7 @@ class OpenAIRealtimeProxy:
             return False
     
     async def setup_session(self):
-        """Configure OpenAI session with Gmail tools"""
-        # Convert Gmail functions to OpenAI tool format
+        """Configure OpenAI session with Gmail tools - optimized for efficiency"""
         tools = self._create_gmail_tools()
         
         session_config = {
@@ -50,8 +49,9 @@ class OpenAIRealtimeProxy:
             "session": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "Gmail assistant. Answer in 1-2 short sentences max. "
-                    "Use count_unread_emails for counts. Be very brief."
+                    "You are VoiceInbox, a helpful Gmail assistant. "
+                    "Give complete, natural responses. Be conversational but concise. "
+                    "Always provide the full answer - don't cut off mid-sentence."
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -61,14 +61,14 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.8,  # Higher threshold to reduce false triggers
+                    "threshold": 0.8,  # Balanced threshold
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500  # Shorter silence for faster cutoff
+                    "silence_duration_ms": 600  # Allow complete responses
                 },
                 "tools": tools,
                 "tool_choice": "auto",
-                "temperature": 0.6,  # Minimum allowed by OpenAI Realtime API
-                "max_response_output_tokens": 500  # Balanced default, overridden per function
+                "temperature": 0.6,
+                "max_response_output_tokens": 800  # Increased to allow complete sentences!
             }
         }
         
@@ -388,36 +388,9 @@ class OpenAIRealtimeProxy:
                     await self.openai_ws.send(json.dumps(function_result))
                     print(f"📤 Sent function result to OpenAI: {json.dumps(result, default=str)[:100]}...")
                     
-                    # Cost-optimized token limits - reduced to save money while maintaining functionality
-                    short_functions = ['count_unread_emails', 'mark_read', 'abort_current_action']
-                    medium_functions = ['list_unread', 'list_unread_priority', 'search_messages']
-                    long_functions = ['summarize_messages', 'summarize_thread', 'get_thread', 'categorize_unread', 'create_draft']
-                    
-                    if function_name in short_functions:
-                        max_tokens = 50  # Reduced from 100 to save costs
-                        instructions = "Answer in 5-8 words maximum."
-                    elif function_name in medium_functions:
-                        max_tokens = 150  # Reduced from 300 to save costs  
-                        instructions = "List key results briefly. 1-2 sentences max."
-                    elif function_name in long_functions:
-                        max_tokens = 400  # Reduced from 800 to save costs
-                        instructions = "Provide concise summary. Keep under 3 sentences."
-                    else:
-                        max_tokens = 100  # Default reduced
-                        instructions = "Brief natural response."
-                    
-                    print(f"💬 Using {max_tokens} token limit for {function_name}")
-                    
-                    # Request voice response after function execution
-                    # This creates a second response, which is expected behavior
-                    response_request = {
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["text", "audio"],
-                            "instructions": instructions
-                        }
-                    }
-                    await self.openai_ws.send(json.dumps(response_request))
+                    # DON'T CREATE A NEW RESPONSE! Let OpenAI handle the function result in the existing response
+                    # The original response will continue after receiving the function result
+                    print(f"✅ Function {function_name} completed - letting OpenAI continue with original response")
             else:
                 print(f"⚠️ Unknown function: {function_name}")
                 

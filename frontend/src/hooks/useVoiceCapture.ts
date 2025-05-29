@@ -91,7 +91,7 @@ export const useVoiceCapture = ({
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
-          sampleRate: 24000,
+          sampleRate: 24000, // REVERTED: Must match OpenAI requirements
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
@@ -135,7 +135,7 @@ export const useVoiceCapture = ({
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: 24000,
+            sampleRate: 24000, // REVERTED: Must match OpenAI requirements
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
@@ -230,7 +230,7 @@ export const useVoiceCapture = ({
           offset += buffer.length
         }
         
-        // Resample to 24kHz if needed
+        // Resample to 24kHz if needed (REVERTED: Must match OpenAI requirements)
         const resampled = resampleAudio(combined, sampleRate, 24000)
         
         // Convert to PCM16

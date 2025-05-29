@@ -35,7 +35,7 @@ export const useAudioPlayback = ({
       
       if (!audioContextRef.current) {
         audioContextRef.current = new AudioContextClass({
-          sampleRate: 24000 // Match OpenAI output sample rate
+          sampleRate: 24000 // REVERTED: Must match OpenAI output sample rate
         })
       }
       
@@ -76,7 +76,7 @@ export const useAudioPlayback = ({
       const audioBuffer = audioContextRef.current.createBuffer(
         1, // Mono
         samples.length,
-        24000 // Sample rate
+        24000 // REVERTED: Must match OpenAI output sample rate
       )
       
       // Convert to float and copy to AudioBuffer
@@ -96,24 +96,22 @@ export const useAudioPlayback = ({
   // Play next audio buffer in queue
   const playNextBuffer = useCallback(() => {
     if (!audioContextRef.current || audioBufferQueueRef.current.length === 0) {
-      // Add a small delay before checking if truly done to ensure all audio plays
-      setTimeout(() => {
-        if (pendingBuffersRef.current === 0 && audioBufferQueueRef.current.length === 0 && hasStartedRef.current && streamEndedRef.current) {
-          if (import.meta.env.DEV) {
-            console.log('🎵 All audio buffers played, ending playback session')
-          }
-          // Clear timeout
-          if (timeoutRef.current) {
-            clearTimeout(timeoutRef.current)
-            timeoutRef.current = null
-          }
-          setIsPlaying(false)
-          isPlayingRef.current = false
-          hasStartedRef.current = false
-          streamEndedRef.current = false
-          onPlaybackEnd?.()
+      // Check if stream is done and queue is empty
+      if (streamEndedRef.current && hasStartedRef.current && audioBufferQueueRef.current.length === 0 && pendingBuffersRef.current === 0) {
+        if (import.meta.env.DEV) {
+          console.log('🎵 All audio buffers played, ending playback session')
         }
-      }, 100) // 100ms delay to ensure audio completion
+        // Clear timeout
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current)
+          timeoutRef.current = null
+        }
+        setIsPlaying(false)
+        isPlayingRef.current = false
+        hasStartedRef.current = false
+        streamEndedRef.current = false
+        onPlaybackEnd?.()
+      }
       return
     }
     
@@ -214,15 +212,26 @@ export const useAudioPlayback = ({
   const markStreamDone = useCallback(() => {
     if (import.meta.env.DEV) {
       console.log('🎵 Audio stream marked as complete')
+      console.log(`🔍 Audio state check: pending=${pendingBuffersRef.current}, queue=${audioBufferQueueRef.current.length}, started=${hasStartedRef.current}, ended=${streamEndedRef.current}`)
     }
+    
+    // ALWAYS set stream as ended - this is the signal that OpenAI is done sending
     streamEndedRef.current = true
     
-    // If no buffers are pending and queue is empty, end immediately
-    if (pendingBuffersRef.current === 0 && audioBufferQueueRef.current.length === 0 && hasStartedRef.current) {
+    // If there are still queued audio chunks OR pending buffers, let them play naturally
+    // The playNextBuffer function will handle completion when everything is truly done
+    if (audioBufferQueueRef.current.length > 0 || pendingBuffersRef.current > 0) {
       if (import.meta.env.DEV) {
-        console.log('🎵 No pending audio, ending playback immediately')
+        console.log(`🎵 Stream ended, but ${audioBufferQueueRef.current.length} chunks queued + ${pendingBuffersRef.current} pending. Letting playback finish naturally.`)
       }
-      // Clear timeout
+      return // Let playNextBuffer handle completion when everything is empty
+    }
+    
+    // Only complete immediately if truly nothing is playing and we had started
+    if (hasStartedRef.current) {
+      if (import.meta.env.DEV) {
+        console.log('🎵 No audio buffers, ending playback immediately')
+      }
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current)
         timeoutRef.current = null
@@ -232,6 +241,12 @@ export const useAudioPlayback = ({
       hasStartedRef.current = false
       streamEndedRef.current = false
       onPlaybackEnd?.()
+    } else {
+      // Stream ended but never started playing - this means OpenAI sent no audio
+      if (import.meta.env.DEV) {
+        console.log('🎵 Stream ended but no audio was played (OpenAI sent no audio)')
+      }
+      streamEndedRef.current = false // Reset for next response
     }
   }, [onPlaybackEnd])
   

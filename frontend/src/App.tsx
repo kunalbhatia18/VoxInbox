@@ -24,6 +24,8 @@ function App() {
   const [isAISpeaking, setIsAISpeaking] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const connectionInitiated = useRef(false) // Prevent React StrictMode double-connections
+  const awaitingAudioRef = useRef(false)
+  const responseTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   // Voice capture hook
   const voiceCapture = useVoiceCapture({
@@ -136,6 +138,13 @@ function App() {
         wsRef.current = null
         window.wsRef = null // Clear global reference
       }
+      
+      // Clean up response timeout
+      if (responseTimeoutRef.current) {
+        clearTimeout(responseTimeoutRef.current)
+        responseTimeoutRef.current = null
+      }
+      
       // Voice capture handles its own cleanup
     }
   }, []) // Stable dependencies
@@ -245,9 +254,32 @@ function App() {
             // Clear any previous audio to ensure clean playback
             audioPlaybackHook.clearQueue()
             
+            // Start tracking for audio response
+            awaitingAudioRef.current = true
+            
+            // Set timeout to detect no-audio responses
+            if (responseTimeoutRef.current) {
+              clearTimeout(responseTimeoutRef.current)
+            }
+            responseTimeoutRef.current = setTimeout(() => {
+              if (awaitingAudioRef.current && !isAISpeaking) {
+                console.log('⚠️ No audio received from OpenAI - text-only response')
+                toast('AI responded with text only - try asking again', { icon: '💬', duration: 3000 })
+                awaitingAudioRef.current = false
+              }
+            }, 3000) // 3 second timeout to detect no-audio responses
+            
           } else if (messageType === 'response.audio.delta') {
             // Handle audio response chunks from OpenAI - MOST IMPORTANT
             if (message.delta) {
+              // Clear awaiting audio flag since we're receiving audio
+              if (awaitingAudioRef.current) {
+                awaitingAudioRef.current = false
+                if (responseTimeoutRef.current) {
+                  clearTimeout(responseTimeoutRef.current)
+                  responseTimeoutRef.current = null
+                }
+              }
               audioPlaybackHook.addAudioChunk(message.delta)
               // Don't log individual chunks - too noisy
             }
@@ -262,6 +294,13 @@ function App() {
             if (import.meta.env.DEV) {
               console.log('✅ OpenAI response complete')
             }
+            
+            // Clean up no-audio detection timeout
+            if (responseTimeoutRef.current) {
+              clearTimeout(responseTimeoutRef.current)
+              responseTimeoutRef.current = null
+            }
+            awaitingAudioRef.current = false
             
           } else if (messageType === 'system') {
             // Handle system messages (like fallback mode)

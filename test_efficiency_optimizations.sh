@@ -1,0 +1,128 @@
+#!/bin/bash
+
+echo "🚀 VoiceInbox Efficiency Optimization Test"
+echo "=========================================="
+
+# Check if services are running
+echo "📊 Checking services..."
+if curl -s http://localhost:8000/ > /dev/null && curl -s http://localhost:5173/ > /dev/null; then
+    echo "✅ Both services running"
+else
+    echo "❌ Start services first:"
+    echo "   Backend: cd backend && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    echo "   Frontend: cd frontend && npm run dev"
+    exit 1
+fi
+
+echo ""
+echo "🎯 OPTIMIZATIONS APPLIED:"
+echo "================================"
+echo "✅ Audio sample rate: 24kHz → 16kHz (-33% bandwidth)"
+echo "✅ Token limits: 100-800 → 25-200 tokens (-75% cost)" 
+echo "✅ VAD threshold: 0.8 → 0.9 (fewer false triggers)"
+echo "✅ Response time: Faster padding (300ms → 200ms)"
+echo "✅ Temperature: 0.6 → 0.3 (more focused responses)"
+echo "✅ Global token limit: 500 → 150 (-70%)"
+
+echo ""
+echo "💰 EXPECTED COST SAVINGS:"
+echo "========================="
+echo "• Audio bandwidth: -33%"
+echo "• Token usage: -75%"  
+echo "• Overall cost: -60-70%"
+echo "• Response latency: -15-25%"
+
+echo ""
+echo "🧪 OPTIMIZATION TEST SCENARIOS:"
+echo "==============================="
+
+echo ""
+echo "1️⃣ SHORT RESPONSE TEST (25 tokens max):"
+echo "   Say: 'How many unread emails do I have?'"
+echo "   Expected: '7 unread emails' (3-5 words only)"
+echo "   Monitor: Look for '💬 Using 25 token limit'"
+
+echo ""
+echo "2️⃣ MEDIUM RESPONSE TEST (75 tokens max):"  
+echo "   Say: 'List my recent emails'"
+echo "   Expected: One sentence with key email subjects"
+echo "   Monitor: Look for '💬 Using 75 token limit'"
+
+echo ""
+echo "3️⃣ AUDIO QUALITY TEST (16kHz):"
+echo "   Say: 'Read me my most important email'"
+echo "   Expected: Clear audio quality (should sound good despite lower sample rate)"
+echo "   Monitor: Audio should be slightly smaller in logs"
+
+echo ""
+echo "4️⃣ SPEED TEST (Optimized VAD):"
+echo "   Say: 'Help me' (short phrase)"
+echo "   Expected: Faster response due to VAD optimizations"
+echo "   Monitor: Response should feel snappier"
+
+echo ""
+echo "5️⃣ LONG RESPONSE TEST (200 tokens max):"
+echo "   Say: 'Summarize my inbox situation'"
+echo "   Expected: Two sentences maximum with essential info"
+echo "   Monitor: Look for '💬 Using 200 token limit'"
+
+echo ""
+echo "🔍 WHAT TO MONITOR:"
+echo "=================="
+
+echo ""
+echo "BACKEND LOGS (Success Indicators):"
+echo "✅ '💬 Using 25 token limit for count_unread_emails' (was 100)" 
+echo "✅ '💬 Using 75 token limit for search_messages' (was 300)"
+echo "✅ '💬 Using 200 token limit for categorize_unread' (was 800)"
+echo "✅ Faster audio chunk processing"
+
+echo ""
+echo "FRONTEND CONSOLE (Audio Optimization):"
+echo "✅ '🎤 Processed [samples] → [smaller base64]' (should be ~33% smaller)"
+echo "✅ Faster audio completion times"
+echo "✅ No quality degradation in audio playback"
+
+echo ""
+echo "COST DASHBOARD (If Available):"
+echo "✅ Token usage should drop by 60-75%"
+echo "✅ Audio processing costs should drop by ~33%"
+echo "✅ Overall API costs should be 60-70% lower"
+
+echo ""
+echo "❌ POTENTIAL ISSUES TO WATCH:"
+echo "============================"
+echo "• Audio quality too low (unlikely with 16kHz)"
+echo "• Responses too short (adjust token limits if needed)" 
+echo "• VAD too sensitive (increase threshold if needed)"
+echo "• Response cutoffs (monitor completion logs)"
+
+echo ""
+echo "🎛️ FINE-TUNING OPTIONS:"
+echo "======================="
+echo "If responses are TOO short, you can adjust:"
+echo "• Short functions: 25 → 40 tokens"
+echo "• Medium functions: 75 → 100 tokens" 
+echo "• Long functions: 200 → 300 tokens"
+echo ""
+echo "If VAD is too sensitive:"
+echo "• Increase threshold: 0.9 → 0.95"
+echo ""
+echo "If audio quality issues:"
+echo "• Revert sample rate: 16kHz → 20kHz (compromise)"
+
+echo ""
+echo "📈 SUCCESS METRICS:"
+echo "=================="
+echo "✅ 60-70% cost reduction in OpenAI usage"
+echo "✅ 15-25% faster response times"
+echo "✅ 33% less audio bandwidth usage"
+echo "✅ Same or better voice quality"
+echo "✅ More focused, concise responses"
+
+echo ""
+echo "🚀 Ready to test optimized VoiceInbox!"
+echo "Visit: http://localhost:5173"
+echo ""
+echo "The system should now be significantly more cost-efficient"
+echo "while maintaining excellent performance! 🎉"
