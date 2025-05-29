@@ -41,7 +41,7 @@ class OpenAIRealtimeProxy:
             return False
     
     async def setup_session(self):
-        """Configure OpenAI session with Gmail tools - optimized for efficiency"""
+        """Configure OpenAI session with Gmail tools - optimized for hands-free operation"""
         tools = self._create_gmail_tools()
         
         session_config = {
@@ -49,9 +49,11 @@ class OpenAIRealtimeProxy:
             "session": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are VoiceInbox, a helpful Gmail assistant. "
-                    "Give complete, natural responses. Be conversational but concise. "
-                    "Always provide the full answer - don't cut off mid-sentence."
+                    "You are VoiceInbox, a helpful Gmail assistant for hands-free operation. "
+                    "Keep responses concise but complete - users are often driving or multitasking. "
+                    "Always provide the full answer without cutting off mid-sentence. "
+                    "For numbers, spell them out (e.g., 'five emails' not '5 emails'). "
+                    "Speak naturally and conversationally."
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -61,14 +63,14 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.8,  # Balanced threshold
+                    "threshold": 0.6,  # More sensitive for hands-free use
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600  # Allow complete responses
+                    "silence_duration_ms": 800  # Slightly longer to prevent cutting off
                 },
                 "tools": tools,
                 "tool_choice": "auto",
                 "temperature": 0.6,
-                "max_response_output_tokens": 800  # Increased to allow complete sentences!
+                "max_response_output_tokens": 400  # Shorter for hands-free use
             }
         }
         
@@ -240,7 +242,8 @@ class OpenAIRealtimeProxy:
             'response.created', 'response.done', 'error',
             'response.audio.delta', 'response.audio.done',
             'response.output_item.added', 'conversation.item.created',
-            'input_audio_buffer.speech_started', 'input_audio_buffer.committed'
+            'input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped',
+            'input_audio_buffer.committed'
         }
         
         if message_type in essential_messages and self.client_ws:

@@ -3,6 +3,7 @@ import { Toaster, toast } from 'react-hot-toast'
 import { GmailTest } from './components/GmailTest'
 import { ConnectionTest } from './components/ConnectionTest'
 import { useVoiceCapture } from './hooks/useVoiceCapture'
+import { useHandsFreeVoiceCapture } from './hooks/useHandsFreeVoiceCapture'
 import { useAudioPlayback } from './hooks/useAudioPlayback'
 
 // Extend Window interface for global WebSocket reference
@@ -17,17 +18,58 @@ function App() {
   const [userEmail, setUserEmail] = useState('')
   const [loading, setLoading] = useState(true)
   const [wsConnected, setWsConnected] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
   const [showTests, setShowTests] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
   const [authCheckInProgress, setAuthCheckInProgress] = useState(false)
   const [isAISpeaking, setIsAISpeaking] = useState(false)
+  const [handsFreeEnabled, setHandsFreeEnabled] = useState(true)
+  const [voiceStatus, setVoiceStatus] = useState<'idle' | 'listening' | 'speech_detected' | 'processing'>('idle')
   const wsRef = useRef<WebSocket | null>(null)
   const connectionInitiated = useRef(false) // Prevent React StrictMode double-connections
   const awaitingAudioRef = useRef(false)
   const responseTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Voice capture hook
+  // Hands-free voice capture hook
+  const handsFreeVoice = useHandsFreeVoiceCapture({
+    onAudioChunk: (audioBase64: string) => {
+      // Send continuous audio chunks to OpenAI via WebSocket
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        const audioMessage = {
+          type: "input_audio_buffer.append",
+          audio: audioBase64
+        }
+        wsRef.current.send(JSON.stringify(audioMessage))
+        
+        // Don't log every chunk - too noisy for continuous streaming
+        if (import.meta.env.DEV && Math.random() < 0.05) { // Log 5% of chunks
+          console.log('🎤 Streaming audio to OpenAI:', audioBase64.length, 'characters')
+        }
+      } else {
+        console.warn('WebSocket not connected, cannot stream audio')
+      }
+    },
+    onError: (error: string) => {
+      console.error('Hands-free voice error:', error)
+      toast.error(`Voice error: ${error}`)
+    },
+    onStatusChange: (status) => {
+      setVoiceStatus(status)
+      if (import.meta.env.DEV) {
+        console.log('Voice status:', status)
+      }
+      
+      if (status === 'listening') {
+        toast('🎤 Listening for voice commands...', { icon: '👂', duration: 2000 })
+      } else if (status === 'speech_detected') {
+        toast('🗣️ Speech detected!', { icon: '🎙️', duration: 1000 })
+      } else if (status === 'processing') {
+        toast('🔄 Processing speech...', { icon: '⚙️', duration: 2000 })
+      }
+    },
+    enabled: handsFreeEnabled && wsConnected && !isAISpeaking
+  })
+  
+  // Legacy push-to-talk voice capture (for fallback)
   const voiceCapture = useVoiceCapture({
     onAudioData: (audioBase64: string) => {
       // Check if we actually have audio data before sending
@@ -74,19 +116,9 @@ function App() {
     onError: (error: string) => {
       console.error('Voice capture error:', error)
       toast.error(`Voice error: ${error}`)
-      setIsRecording(false)
     },
     onStatusChange: (status) => {
-      console.log('Voice status:', status)
-      if (status === 'recording') {
-        setIsRecording(true)
-        toast('🎤 Recording voice...', { icon: '🎤' })
-      } else if (status === 'processing') {
-        setIsRecording(false)
-        toast('🔄 Processing audio...', { icon: '⚙️' })
-      } else {
-        setIsRecording(false)
-      }
+      console.log('Legacy voice status:', status)
     }
   })
 
@@ -111,11 +143,6 @@ function App() {
   }), []) // Empty dependency array for stable callbacks
 
   const audioPlaybackHook = useAudioPlayback(audioPlayback)
-
-  // Update recording state when voice capture changes
-  useEffect(() => {
-    setIsRecording(voiceCapture.isRecording)
-  }, [voiceCapture.isRecording])
 
   useEffect(() => {
     if (import.meta.env.DEV) {
@@ -269,6 +296,20 @@ function App() {
               }
             }, 3000) // 3 second timeout to detect no-audio responses
             
+          } else if (messageType === 'input_audio_buffer.speech_started') {
+            // OpenAI detected speech starting
+            if (import.meta.env.DEV) {
+              console.log('🗣️ OpenAI VAD: Speech started')
+            }
+            handsFreeVoice.handleVADEvent('speech_started')
+            
+          } else if (messageType === 'input_audio_buffer.speech_stopped') {
+            // OpenAI detected speech ending
+            if (import.meta.env.DEV) {
+              console.log('🤐 OpenAI VAD: Speech stopped')
+            }
+            handsFreeVoice.handleVADEvent('speech_stopped')
+            
           } else if (messageType === 'response.audio.delta') {
             // Handle audio response chunks from OpenAI - MOST IMPORTANT
             if (message.delta) {
@@ -420,73 +461,20 @@ function App() {
     }
   }
 
-  // Voice recording handlers
+  // Voice recording handlers (legacy - kept for fallback)
   const handleStartRecording = async () => {
-    if (!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      toast.error('Please connect to Gmail service first')
-      return
+    // Fallback to push-to-talk if hands-free fails
+    if (handsFreeVoice.permissionStatus === 'denied' || !handsFreeVoice.isSupported) {
+      console.log('Using fallback push-to-talk mode')
+      await voiceCapture.startRecording()
     }
-    
-    // Prevent recording if AI is speaking
-    if (isAISpeaking) {
-      console.log('AI is speaking, cannot start recording')
-      toast.error('Please wait for AI to finish speaking')
-      return
-    }
-    
-    // Prevent double-start
-    if (isRecording || voiceCapture.isRecording) {
-      console.log('Already recording, ignoring start request')
-      return
-    }
-    
-    // Check microphone support
-    if (!voiceCapture.isSupported) {
-      toast.error('Microphone not supported in this browser')
-      return
-    }
-    
-    // Stop any ongoing audio playback first
-    audioPlaybackHook.stopPlayback()
-    
-    // Initialize audio playback context on user gesture (required by browsers)
-    try {
-      if (!audioPlaybackHook.isSupported) {
-        console.log('🔊 Initializing audio playback on user gesture...')
-        // This will create AudioContext after user interaction
-      }
-    } catch (error) {
-      console.warn('Audio playback initialization warning:', error)
-    }
-    
-    // Request permission if needed
-    if (voiceCapture.permissionStatus === 'prompt') {
-      const granted = await voiceCapture.requestPermission()
-      if (!granted) {
-        toast.error('Microphone permission required for voice commands')
-        return
-      }
-    }
-    
-    if (voiceCapture.permissionStatus === 'denied') {
-      toast.error('Microphone permission denied')
-      return
-    }
-    
-    // Start recording
-    await voiceCapture.startRecording()
   }
 
   const handleStopRecording = () => {
-    // Prevent double-stop and only stop if actually recording
-    if (!isRecording && !voiceCapture.isRecording) {
-      console.log('Not recording, ignoring stop request')
-      return
+    // Fallback to push-to-talk if hands-free fails
+    if (voiceCapture.isRecording) {
+      voiceCapture.stopRecording()
     }
-    
-    voiceCapture.stopRecording()
-    // The commit and response.create are now sent in onAudioData callback
-    // after the audio is actually processed and sent
   }
 
   if (loading) {
@@ -581,87 +569,111 @@ function App() {
                     : isAISpeaking
                     ? '🤖 AI is responding... Please wait.'
                     : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
-                      ? '🎤 Ready for voice commands! Press and hold to talk.'
+                      ? handsFreeEnabled
+                        ? '🎤 Hands-free mode active - Just speak naturally!'
+                        : '🎤 Ready for voice commands! Click to enable hands-free mode.'
                       : 'Connection lost - click Reconnect'
                   }
                   {import.meta.env.DEV && (
                     <span className="text-xs text-gray-400 block mt-1">
-                      WS State: {wsRef.current ? wsRef.current.readyState : 'null'} | Connected: {wsConnected.toString()} | Connecting: {isConnecting.toString()}
+                      WS State: {wsRef.current ? wsRef.current.readyState : 'null'} | Connected: {wsConnected.toString()} | Hands-free: {handsFreeEnabled.toString()} | Voice: {voiceStatus}
                     </span>
                   )}
                 </p>
 
-                {/* Push-to-talk button */}
-                <button
-                  onMouseDown={(e) => {
-                    e.preventDefault()
-                    handleStartRecording()
-                  }}
-                  onMouseUp={(e) => {
-                    e.preventDefault()
-                    handleStopRecording()
-                  }}
-                  onMouseLeave={(e) => {
-                    e.preventDefault()
-                    // Stop recording if mouse leaves button while held down
-                    if (isRecording || voiceCapture.isRecording) {
-                      handleStopRecording()
+                {/* Voice Status Indicator */}
+                <div className="mb-8">
+                  <div
+                    className={
+                      `w-32 h-32 rounded-full transition-all duration-300 mx-auto flex items-center justify-center ` +
+                      (isAISpeaking
+                        ? 'bg-purple-500 scale-105 shadow-lg animate-pulse'
+                        : voiceStatus === 'speech_detected'
+                        ? 'bg-orange-500 scale-110 shadow-lg animate-pulse'
+                        : voiceStatus === 'listening' && handsFreeEnabled
+                        ? 'bg-green-500 scale-100 shadow-md animate-pulse'
+                        : voiceStatus === 'processing'
+                        ? 'bg-yellow-500 scale-105 shadow-lg animate-pulse'
+                        : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN)
+                        ? 'bg-blue-500 hover:bg-blue-600 shadow cursor-pointer'
+                        : 'bg-gray-300')
                     }
-                  }}
-                  onTouchStart={(e) => {
-                    e.preventDefault()
-                    handleStartRecording()
-                  }}
-                  onTouchEnd={(e) => {
-                    e.preventDefault()
-                    handleStopRecording()
-                  }}
-                  disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !voiceCapture.isSupported || isAISpeaking}
-                  className={
-                    `w-32 h-32 rounded-full transition-all duration-200 ` +
-                    (isRecording
-                      ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
-                      : isAISpeaking
-                      ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
-                      : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && voiceCapture.isSupported)
-                      ? 'bg-blue-500 hover:bg-blue-600 shadow'
-                      : 'bg-gray-300 cursor-not-allowed')
-                  }
-                >
-                  {isAISpeaking ? (
-                    // Speaker icon when AI is speaking
-                    <svg
-                      className="w-12 h-12 mx-auto text-white"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
-                    </svg>
-                  ) : (
-                    // Microphone icon when ready to record
-                    <svg
-                      className="w-12 h-12 mx-auto text-white"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                      <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-                    </svg>
-                  )}
-                </button>
+                    onClick={() => {
+                      if (!handsFreeEnabled && wsConnected && !isAISpeaking) {
+                        setHandsFreeEnabled(true)
+                        toast('Hands-free mode enabled!', { icon: '🎤' })
+                      }
+                    }}
+                  >
+                    {isAISpeaking ? (
+                      // Speaker icon when AI is speaking
+                      <svg
+                        className="w-12 h-12 text-white"
+                        fill="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                      </svg>
+                    ) : voiceStatus === 'speech_detected' ? (
+                      // Waveform icon when speech is detected
+                      <svg
+                        className="w-12 h-12 text-white"
+                        fill="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
+                      </svg>
+                    ) : (
+                      // Microphone icon for listening/ready states
+                      <svg
+                        className="w-12 h-12 text-white"
+                        fill="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                      </svg>
+                    )}
+                  </div>
+                </div>
+
+                {/* Hands-free Toggle */}
+                <div className="mb-4">
+                  <button
+                    onClick={() => {
+                      setHandsFreeEnabled(!handsFreeEnabled)
+                      toast(handsFreeEnabled ? 'Hands-free mode disabled' : 'Hands-free mode enabled!', { 
+                        icon: handsFreeEnabled ? '🛑' : '🎤' 
+                      })
+                    }}
+                    disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN}
+                    className={
+                      `px-6 py-2 rounded-lg font-medium transition-colors ` +
+                      (handsFreeEnabled
+                        ? 'bg-green-500 text-white hover:bg-green-600'
+                        : 'bg-gray-500 text-white hover:bg-gray-600')
+                    }
+                  >
+                    {handsFreeEnabled ? '🎤 Hands-Free ON' : '🛑 Hands-Free OFF'}
+                  </button>
+                </div>
 
                 <p className="mt-4 text-xs text-gray-500">
-                  {!voiceCapture.isSupported 
+                  {!handsFreeVoice.isSupported 
                     ? 'Microphone not supported in this browser'
-                    : voiceCapture.permissionStatus === 'denied'
+                    : handsFreeVoice.permissionStatus === 'denied'
                     ? 'Microphone permission denied - please allow access'
                     : isAISpeaking
                     ? '🤖 AI is speaking - please wait for response to finish'
-                    : isRecording 
-                    ? '🎤 Listening... Release to stop'
-                    : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN)
-                    ? 'Hold to talk with VoiceInbox'
-                    : 'Connect to Gmail service first'
+                    : handsFreeEnabled && voiceStatus === 'listening'
+                    ? '👂 Listening continuously - just speak naturally'
+                    : handsFreeEnabled && voiceStatus === 'speech_detected'
+                    ? '🎙️ Speech detected - processing...'
+                    : handsFreeEnabled && voiceStatus === 'processing'
+                    ? '⚙️ Processing your request...'
+                    : handsFreeEnabled
+                    ? '📶 Setting up hands-free listening...'
+                    : 'Click "Hands-Free ON" to enable voice commands'
                   }
                 </p>
               </div>
