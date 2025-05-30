@@ -1,4 +1,3 @@
 #!/bin/bash
-chmod +x /Users/kunal/voice-inbox-mvp/test_efficiency_optimizations.sh
-echo "✅ Test script made executable"
-echo "Run with: ./test_efficiency_optimizations.sh"
+chmod +x /Users/kunal/voice-inbox-mvp/test_fixes.sh
+echo "Made test script executable"

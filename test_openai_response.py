@@ -28,7 +28,7 @@ async def test_openai_realtime():
         print("🔗 Connecting to OpenAI Realtime API...")
         
         async with websockets.connect(
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+            "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
             extra_headers=headers,
             max_size=1024*1024*16
         ) as ws:
