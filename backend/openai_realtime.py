@@ -26,7 +26,7 @@ class OpenAIRealtimeHandler:
         try:
             print("🔗 Connecting to OpenAI Realtime API...")
             self.openai_ws = await websockets.connect(
-                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+                "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
                 extra_headers=headers,
                 max_size=1024*1024*16  # 16MB max message size
             )

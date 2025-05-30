@@ -7,6 +7,7 @@ import base64
 import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
@@ -68,6 +69,18 @@ CACHE_DB_PATH = "gmail_cache.db"
 MAX_CACHE_SIZE_MB = 10
 CACHE_EXPIRY_SECONDS = 300  # 5 minutes
 
+# Issue 6 Fix: Enhanced memory management
+MAX_FUNCTION_RESULT_SIZE = 4000  # Consistent truncation for all functions
+MAX_EMAIL_BODY_SIZE = 100000     # 100KB per email body
+MAX_SUMMARY_LENGTH = 1000        # Summary length limit
+MAX_MEMORY_CACHE_ITEMS = 1000    # Max items in memory before cleanup
+
+# Issue 9 Fix: Rate limiting configuration
+RATE_LIMIT_REQUESTS_PER_MINUTE = 60  # Per user per minute
+RATE_LIMIT_OPENAI_CALLS_PER_MINUTE = 30  # OpenAI API calls per user
+RATE_LIMIT_GMAIL_CALLS_PER_MINUTE = 100  # Gmail API calls per user
+RATE_LIMIT_WINDOW_SIZE = 60  # Rate limit window in seconds
+
 # Initialize FastAPI
 app = FastAPI(title="VoiceInbox MVP API")
 
@@ -84,6 +97,20 @@ app.add_middleware(
 sessions: Dict[str, Dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
 active_proxies: Dict[str, OpenAIRealtimeProxy] = {}  # Store proxy instances per user
+
+# Issue 9 Fix: Rate limiting storage
+rate_limit_data: Dict[str, Dict[str, deque]] = defaultdict(lambda: {
+    'requests': deque(),
+    'openai_calls': deque(),
+    'gmail_calls': deque()
+})
+
+# Issue 6 Fix: Memory management tracking
+memory_usage_tracker = {
+    'function_calls': 0,
+    'cache_items': 0,
+    'last_cleanup': time.time()
+}
 
 # Pydantic models for Gmail helpers
 class SearchMessagesArgs(BaseModel):
@@ -150,6 +177,103 @@ class CreateCalendarEventArgs(BaseModel):
     end_epoch_ms: int
     attendees: List[str] = Field(default=[])
 
+# Issue 9 Fix: Rate limiting functions
+def check_rate_limit(user_id: str, limit_type: str, limit_per_minute: int) -> bool:
+    """Check if user has exceeded rate limit for given type"""
+    now = time.time()
+    user_limits = rate_limit_data[user_id]
+    
+    # Clean old entries (older than rate limit window)
+    limit_deque = user_limits[limit_type]
+    while limit_deque and limit_deque[0] < now - RATE_LIMIT_WINDOW_SIZE:
+        limit_deque.popleft()
+    
+    # Check if limit exceeded
+    if len(limit_deque) >= limit_per_minute:
+        return False
+    
+    # Add current request
+    limit_deque.append(now)
+    return True
+
+def cleanup_rate_limit_data() -> None:
+    """Clean up old rate limit data to prevent memory leaks"""
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW_SIZE * 2  # Keep 2x window for safety
+    
+    for user_id in list(rate_limit_data.keys()):
+        user_data = rate_limit_data[user_id]
+        total_entries = sum(len(deque_data) for deque_data in user_data.values())
+        
+        # Clean each deque
+        for limit_type in user_data:
+            limit_deque = user_data[limit_type]
+            while limit_deque and limit_deque[0] < cutoff:
+                limit_deque.popleft()
+        
+        # Remove user if no recent activity
+        if all(len(deque_data) == 0 for deque_data in user_data.values()):
+            del rate_limit_data[user_id]
+
+# Issue 6 Fix: Memory management functions
+def truncate_large_result(result: Any, max_size: int = MAX_FUNCTION_RESULT_SIZE) -> str:
+    """Consistently truncate large results to prevent memory issues"""
+    result_str = json.dumps(result, default=str)
+    
+    if len(result_str) <= max_size:
+        return result_str
+    
+    # Try intelligent truncation for common data structures
+    if isinstance(result, dict):
+        if 'messages' in result and isinstance(result['messages'], list):
+            # Truncate email messages intelligently
+            truncated_result = result.copy()
+            truncated_messages = []
+            
+            for msg in result['messages']:
+                truncated_msg = msg.copy() if isinstance(msg, dict) else msg
+                if isinstance(truncated_msg, dict):
+                    # Truncate email body
+                    if 'body' in truncated_msg and len(str(truncated_msg['body'])) > 500:
+                        truncated_msg['body'] = str(truncated_msg['body'])[:500] + '... (truncated)'
+                    # Truncate snippet
+                    if 'snippet' in truncated_msg and len(str(truncated_msg['snippet'])) > 200:
+                        truncated_msg['snippet'] = str(truncated_msg['snippet'])[:200] + '...'
+                
+                truncated_messages.append(truncated_msg)
+                
+                # Check if we're within size limit
+                current_size = len(json.dumps({'messages': truncated_messages}, default=str))
+                if current_size > max_size * 0.8:  # Leave some room
+                    break
+            
+            truncated_result['messages'] = truncated_messages
+            result_str = json.dumps(truncated_result, default=str)
+    
+    # Final truncation if still too large
+    if len(result_str) > max_size:
+        result_str = result_str[:max_size] + '... (truncated for size)'
+    
+    return result_str
+
+def cleanup_memory_usage() -> None:
+    """Periodic memory cleanup"""
+    global memory_usage_tracker
+    now = time.time()
+    
+    # Only cleanup every 5 minutes
+    if now - memory_usage_tracker['last_cleanup'] < 300:
+        return
+    
+    memory_usage_tracker['last_cleanup'] = now
+    
+    # Cleanup rate limit data
+    cleanup_rate_limit_data()
+    
+    # Log memory stats
+    print(f"🧹 Memory cleanup: {memory_usage_tracker['function_calls']} function calls processed")
+    memory_usage_tracker['function_calls'] = 0
+
 # Initialize SQLite cache
 async def init_cache():
     async with aiosqlite.connect(CACHE_DB_PATH) as db:
@@ -164,8 +288,10 @@ async def init_cache():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_cached_at ON message_cache(user_id, cached_at)")
         await db.commit()
 
-async def cache_get(user_id: str, key: str) -> Optional[Dict]:
+async def cache_get(user_id: str, key: str, custom_expiry: Optional[int] = None) -> Optional[Dict]:
     """Get cached data if not expired"""
+    expiry = custom_expiry or CACHE_EXPIRY_SECONDS
+    
     async with aiosqlite.connect(CACHE_DB_PATH) as db:
         cursor = await db.execute(
             "SELECT data, cached_at FROM message_cache WHERE cache_key = ? AND user_id = ?",
@@ -174,7 +300,7 @@ async def cache_get(user_id: str, key: str) -> Optional[Dict]:
         row = await cursor.fetchone()
         if row:
             data, cached_at = row
-            if time.time() - cached_at < CACHE_EXPIRY_SECONDS:
+            if time.time() - cached_at < expiry:
                 return json.loads(data)
     return None
 
@@ -197,9 +323,9 @@ async def cache_set(user_id: str, key: str, data: Dict):
             )
             await db.commit()
 
-# Helper function to get current user
+# Helper function to get current user with rate limiting
 def get_current_user(request: Request) -> str:
-    """Get current user from session cookie"""
+    """Get current user from session cookie with rate limiting"""
     session_id = request.cookies.get("session_id")
     if not session_id or session_id not in sessions:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -209,7 +335,13 @@ def get_current_user(request: Request) -> str:
         del sessions[session_id]
         raise HTTPException(status_code=401, detail="Session expired")
     
-    return session["user_id"]
+    user_id = session["user_id"]
+    
+    # Issue 9 Fix: Rate limiting for general requests
+    if not check_rate_limit(user_id, 'requests', RATE_LIMIT_REQUESTS_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait a moment.")
+    
+    return user_id
 
 # Gmail service helper with token refresh
 def get_gmail_service(user_id: str):
@@ -235,9 +367,17 @@ def get_gmail_service(user_id: str):
     
     return build("gmail", "v1", credentials=credentials)
 
-# Gmail helper functions
+# Gmail helper functions with rate limiting and memory management
 async def search_messages(user_id: str, args: SearchMessagesArgs) -> Dict:
-    """Search Gmail messages"""
+    """Search Gmail messages with rate limiting and memory management"""
+    # Issue 9 Fix: Rate limiting check
+    if not check_rate_limit(user_id, 'gmail_calls', RATE_LIMIT_GMAIL_CALLS_PER_MINUTE):
+        raise ValueError("RATE_LIMIT: Too many Gmail API calls. Please wait a moment.")
+    
+    # Issue 6 Fix: Track function calls
+    memory_usage_tracker['function_calls'] += 1
+    cleanup_memory_usage()  # Periodic cleanup
+    
     cache_key = f"search:{args.query}:{args.max_results}"
     cached = await cache_get(user_id, cache_key)
     if cached and not args.include_body:
@@ -278,9 +418,10 @@ async def search_messages(user_id: str, args: SearchMessagesArgs) -> Dict:
                 
                 if args.include_body:
                     body = extract_body(msg_detail.get('payload', {}))
-                    if len(body) > 100000:  # 100KB limit
+                    # Issue 6 Fix: Consistent body size limiting
+                    if len(body) > MAX_EMAIL_BODY_SIZE:
                         msg_info['body_truncated'] = True
-                        msg_info['body'] = body[:100000]
+                        msg_info['body'] = body[:MAX_EMAIL_BODY_SIZE]
                     else:
                         msg_info['body'] = body
                 
@@ -359,7 +500,11 @@ async def get_thread(user_id: str, args: GetThreadArgs) -> Dict:
         raise ValueError(f"THREAD_ERROR: {str(e)}")
 
 async def summarize_messages(user_id: str, args: SummarizeMessagesArgs) -> Dict:
-    """Summarize multiple messages using GPT"""
+    """Summarize multiple messages using GPT with rate limiting"""
+    # Issue 9 Fix: Rate limiting for OpenAI calls
+    if not check_rate_limit(user_id, 'openai_calls', RATE_LIMIT_OPENAI_CALLS_PER_MINUTE):
+        raise ValueError("RATE_LIMIT: Too many OpenAI API calls. Please wait a moment.")
+    
     # First fetch the messages
     messages_data = []
     service = get_gmail_service(user_id)
@@ -403,14 +548,18 @@ async def summarize_messages(user_id: str, args: SummarizeMessagesArgs) -> Dict:
         )
         
         return {
-            'summary': response.choices[0].message.content,
+            'summary': response.choices[0].message.content[:MAX_SUMMARY_LENGTH],  # Issue 6 Fix: Limit summary length
             'message_count': len(messages_data)
         }
     except Exception as e:
         return {'summary': f'Error creating summary: {str(e)}', 'message_count': len(messages_data)}
 
 async def summarize_thread(user_id: str, args: SummarizeThreadArgs) -> Dict:
-    """Summarize an email thread"""
+    """Summarize an email thread with rate limiting"""
+    # Issue 9 Fix: Rate limiting for OpenAI calls
+    if not check_rate_limit(user_id, 'openai_calls', RATE_LIMIT_OPENAI_CALLS_PER_MINUTE):
+        raise ValueError("RATE_LIMIT: Too many OpenAI API calls. Please wait a moment.")
+    
     thread = await get_thread(user_id, GetThreadArgs(thread_id=args.thread_id, include_body=True))
     
     prompt = "Summarize this email thread:\n\n"
@@ -428,7 +577,7 @@ async def summarize_thread(user_id: str, args: SummarizeThreadArgs) -> Dict:
         )
         
         return {
-            'summary': response.choices[0].message.content,
+            'summary': response.choices[0].message.content[:MAX_SUMMARY_LENGTH],  # Issue 6 Fix: Limit summary length
             'message_count': len(thread['messages'])
         }
     except Exception as e:
@@ -629,7 +778,15 @@ async def abort_current_action(user_id: str) -> Dict:
     return {'status': 'acknowledged', 'message': 'Operation cancelled'}
 
 async def count_unread_emails(user_id: str) -> Dict:
-    """Get accurate count of unread emails only"""
+    """Get accurate count of unread emails only - with 10-second cache for speed"""
+    
+    # Check ultra-short-term cache (10 seconds) for instant responses
+    cache_key = f"count_unread:{user_id}"
+    cached_result = await cache_get(user_id, cache_key, 10)  # 10-second cache for speed
+    if cached_result:
+        print(f"⚡ Using cached unread count for INSTANT speed boost")
+        return cached_result
+    
     try:
         service = get_gmail_service(user_id)
         
@@ -642,11 +799,17 @@ async def count_unread_emails(user_id: str) -> Dict:
         
         actual_count = len(result.get('messages', []))
         
-        return {
+        response_data = {
             'count': actual_count,
             'exact_count': True,
-            'clear_message': f'You have exactly {actual_count} unread email{"s" if actual_count != 1 else ""}.'
+            'clear_message': f'You have exactly {actual_count} unread email{"s" if actual_count != 1 else ""}.',
+            'cached_at': int(time.time())
         }
+        
+        # Cache for 10 seconds for lightning-fast repeat queries
+        await cache_set(user_id, cache_key, response_data)
+        
+        return response_data
         
     except Exception as e:
         return {
@@ -933,6 +1096,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 print(f"Error cleaning up proxy: {e}")
             del active_proxies[user_id]
             print(f"🧹 Cleaned up proxy for user {user_id}")
+        
+        # Issue 6 Fix: Cleanup memory when websocket disconnects
+        cleanup_memory_usage()
 
 async def handle_direct_function_call(websocket: WebSocket, user_id: str, message: Dict):
     """Handle direct function calls (for backward compatibility and testing)"""
@@ -1008,12 +1174,14 @@ async def test_function(function_name: str, request: Request):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize cache on startup"""
+    """Initialize cache and systems on startup"""
     await init_cache()
     print("✅ Gmail cache initialized")
     print(f"✅ {len(GMAIL_FUNCTIONS)} Gmail functions available")
     print("🎙️ OpenAI Realtime API integration ready")
     print("🔄 Backward compatibility maintained for existing functions")
+    print(f"🛡️ Rate limiting enabled: {RATE_LIMIT_REQUESTS_PER_MINUTE} req/min, {RATE_LIMIT_GMAIL_CALLS_PER_MINUTE} Gmail/min, {RATE_LIMIT_OPENAI_CALLS_PER_MINUTE} OpenAI/min")
+    print(f"🧹 Memory management enabled: {MAX_FUNCTION_RESULT_SIZE}B result limit, {MAX_EMAIL_BODY_SIZE}B email limit")
 
 if __name__ == "__main__":
     import uvicorn

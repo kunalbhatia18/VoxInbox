@@ -2,6 +2,7 @@ import asyncio
 import json
 import websockets
 import os
+import time
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
@@ -19,6 +20,7 @@ class OpenAIRealtimeProxy:
         self.openai_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.client_ws: Optional[Any] = None  # Frontend WebSocket
         self.user_id: Optional[str] = None
+        self.pending_audio_response = False  # Track if we're waiting for audio response
         
     async def connect_to_openai(self):
         """Connect to OpenAI Realtime API"""
@@ -30,18 +32,21 @@ class OpenAIRealtimeProxy:
         try:
             print("🔗 Connecting to OpenAI Realtime API...")
             self.openai_ws = await websockets.connect(
-                "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+                "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
                 extra_headers=headers,
-                max_size=1024*1024*16
+                max_size=1024*1024*16,
+                ping_interval=30,  # Send ping every 30 seconds
+                ping_timeout=10,   # Wait 10 seconds for pong
+                close_timeout=10   # Wait 10 seconds for close
             )
-            print("✅ Connected to OpenAI Realtime API")
+            print("✅ Connected to OpenAI Realtime API (gpt-4o-mini-realtime-preview-2024-12-17)")
             return True
         except Exception as e:
             print(f"❌ OpenAI connection failed: {e}")
             return False
     
     async def setup_session(self):
-        """Configure OpenAI session with Gmail tools - optimized for efficiency"""
+        """Configure OpenAI session with Gmail tools - optimized for audio responses"""
         tools = self._create_gmail_tools()
         
         session_config = {
@@ -49,9 +54,16 @@ class OpenAIRealtimeProxy:
             "session": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are VoiceInbox, a helpful Gmail assistant. "
-                    "Give complete, natural responses. Be conversational but concise. "
-                    "Always provide the full answer - don't cut off mid-sentence."
+                    "You are VoiceInbox, a Gmail assistant that helps users with their emails. "
+                    "IMPORTANT WORKFLOW: For any email-related question, you must: "
+                    "1) First call the appropriate function to get the data "
+                    "2) Then immediately give a natural spoken audio response based on that data "
+                    "For 'how many unread emails' -> call count_unread_emails, then speak the count "
+                    "For 'list emails' -> call list_unread, then speak about the emails "
+                    "For 'search emails' -> call search_messages, then speak about results "
+                    "CRITICAL: Always provide a complete spoken audio response after every function call. "
+                    "Never stop after just calling a function - always follow up with speech. "
+                    "Be conversational and helpful in your audio responses."
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -61,14 +73,14 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.8,  # Balanced threshold
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600  # Allow complete responses
+                    "threshold": 0.5,  # Lower threshold for faster detection
+                    "prefix_padding_ms": 100,  # Minimal padding for maximum speed
+                    "silence_duration_ms": 200  # Ultra-fast silence detection for <250ms
                 },
                 "tools": tools,
                 "tool_choice": "auto",
                 "temperature": 0.6,
-                "max_response_output_tokens": 800  # Increased to allow complete sentences!
+                "max_response_output_tokens": 800  # CORRECTED: For session.update use max_response_output_tokens
             }
         }
         
@@ -76,6 +88,9 @@ class OpenAIRealtimeProxy:
             await self.openai_ws.send(json.dumps(session_config))
             print("📤 Sent session config with Gmail tools")
             print(f"🔧 Configured {len(tools)} Gmail functions for OpenAI")
+            print(f"🎯 Tools available: {[tool['name'] for tool in tools]}")
+            print(f"💬 Instructions: {session_config['session']['instructions'][:100]}...")
+            print(f"🔧 Tool choice: {session_config['session']['tool_choice']}")
     
     def _create_gmail_tools(self):
         """Convert Gmail functions to OpenAI tool format"""
@@ -84,7 +99,7 @@ class OpenAIRealtimeProxy:
             {
                 "type": "function",
                 "name": "count_unread_emails",
-                "description": "Get the accurate count of unread emails (use this for 'how many unread emails' questions)",
+                "description": "REQUIRED: Call this function whenever user asks 'how many unread emails', 'unread count', 'how many emails', or similar counting questions. Returns exact number of unread emails.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -216,6 +231,20 @@ class OpenAIRealtimeProxy:
                 # Only log important messages
                 if message_type in ["input_audio_buffer.commit", "response.create"]:
                     print(f"📤 Forwarded {message_type} to OpenAI")
+                
+                # CRITICAL FIX: Simplified response creation - inherit session settings
+                if message_type == "input_audio_buffer.commit":
+                    # Create response automatically after commit - MUCH SIMPLER
+                    response_message = {
+                        "type": "response.create"
+                    }
+                    # That's it! Let it inherit all settings from session including:
+                    # - modalities: ["text", "audio"]
+                    # - voice: "alloy"
+                    # - output_audio_format: "pcm16"
+                    # - tools and instructions from session
+                    await self.openai_ws.send(json.dumps(response_message))
+                    print("🤖 Auto-created simplified response (inherits session settings)")
         
         # Legacy audio message handling (for backward compatibility)
         elif message_type == "audio":
@@ -267,11 +296,86 @@ class OpenAIRealtimeProxy:
             self._audio_chunk_count = 0
             pass  # Logging handled in _listen_to_openai
         
+        elif message_type == "conversation.item.created":
+            print(f"📝 Conversation item created: {message_data.get('item', {}).get('type', 'unknown')}")
+            
+        elif message_type == "response.output_item.added":
+            item = message_data.get('item', {})
+            print(f"📝 Response output item added: {item.get('type', 'unknown')}")
+            if item.get('type') == 'message':
+                content = item.get('content', [])
+                print(f"📝 Message item added with {len(content)} content items")
+                for i, content_item in enumerate(content):
+                    print(f"    Content {i}: {content_item.get('type', 'unknown')}")
+        
         elif message_type == "response.done":
+            # Log the full response to debug why no audio is being returned
+            response = message_data.get('response', {})
+            output_items = response.get('output', [])
+            
+            print(f"🎙️ Response done. Output items: {len(output_items)}")
+            for i, item in enumerate(output_items):
+                item_type = item.get('type', 'unknown')
+                print(f"  Item {i}: type={item_type}")
+                if item_type == 'message':
+                    role = item.get('role', 'unknown')
+                    content = item.get('content', [])
+                    print(f"    Role: {role}, Content items: {len(content)}")
+                    for j, content_item in enumerate(content):
+                        content_type = content_item.get('type', 'unknown')
+                        print(f"      Content {j}: type={content_type}")
+                        if content_type == 'audio':
+                            print(f"        Audio found!")
+                        elif content_type == 'text':
+                            text_content = content_item.get('text', '')[:50]
+                            print(f"        Text: {text_content}...")
+            
+            # Reset pending audio response flag when any response completes
+            if hasattr(self, 'pending_audio_response'):
+                self.pending_audio_response = False
+            
+            # Reset timing variables for next interaction
+            if hasattr(self, '_speech_start_time'):
+                delattr(self, '_speech_start_time')
+            if hasattr(self, '_first_audio_time'):
+                delattr(self, '_first_audio_time')
+            
+            if not any(item.get('type') == 'message' for item in output_items):
+                print("⚠️ No message items found in response!")
+            
             pass  # Logging handled in _listen_to_openai
         
+        elif message_type == "input_audio_buffer.speech_started":
+            print("🎤 User started speaking")
+            # Start timing for latency measurement
+            if not hasattr(self, '_speech_start_time'):
+                self._speech_start_time = time.time()
+        
+        elif message_type == "input_audio_buffer.committed":
+            if hasattr(self, '_speech_start_time'):
+                commit_time = time.time()
+                speech_duration = (commit_time - self._speech_start_time) * 1000
+                print(f"⏱️ User spoke for {speech_duration:.0f}ms before VAD cutoff")
+        
+        elif message_type == "response.audio.delta":
+            # First audio chunk - measure total latency
+            if hasattr(self, '_speech_start_time') and not hasattr(self, '_first_audio_time'):
+                self._first_audio_time = time.time()
+                total_latency = (self._first_audio_time - self._speech_start_time) * 1000
+                print(f"⚡ TOTAL LATENCY: {total_latency:.0f}ms (target: <250ms)")
+                if total_latency > 250:
+                    print(f"⚠️ Latency above target! Consider optimizing VAD settings.")
+                else:
+                    print(f"✅ Latency within target!")
+        
+        elif message_type == "conversation.item.input_audio_transcription.completed":
+            transcription = message_data.get('transcript', '')
+            print(f"🎤 User said: '{transcription}'")
+            
         elif message_type == "response.function_call_arguments.done":
             # Function call completed - execute it
+            start_time = time.time()  # Performance timing
+            
             item_id = message_data.get("item_id")
             call_id = message_data.get("call_id")
             function_name = message_data.get("name")
@@ -282,6 +386,18 @@ class OpenAIRealtimeProxy:
             if function_name and function_args is not None:
                 print(f"🔧 Executing Gmail function: {function_name}")
                 await self._execute_function(call_id or item_id, function_name, function_args)
+                
+                # Performance logging
+                execution_time = (time.time() - start_time) * 1000  # Convert to ms
+                print(f"⚡ Function {function_name} completed in {execution_time:.0f}ms")
+        
+        elif message_type.startswith("response.function_call"):
+            print(f"🔧 Function call event: {message_type}")
+            print(f"🔍 Full message data: {json.dumps(message_data, indent=2)}")
+            if message_type == "response.function_call_arguments.delta":
+                function_name = message_data.get('name', 'unknown')
+                args_delta = message_data.get('delta', '')
+                print(f"🔧 Function call in progress: {function_name}, args: {args_delta}")
         
         elif message_type in ["session.created", "session.updated"]:
             # Send confirmation to frontend that session is ready
@@ -356,23 +472,22 @@ class OpenAIRealtimeProxy:
                         # Fallback - just pass args as is
                         result = await func(self.user_id, args)
                 
-                # Limit result size for OpenAI to prevent audio generation issues
-                result_str = json.dumps(result, default=str)
-                if len(result_str) > 4000:  # Limit to 4KB for audio responses
-                    # Truncate large results intelligently
-                    if isinstance(result, dict) and 'messages' in result:
-                        # For email search results, limit message content
-                        truncated_result = result.copy()
-                        if 'messages' in truncated_result:
-                            for msg in truncated_result['messages']:
-                                if 'body' in msg and len(msg['body']) > 500:
-                                    msg['body'] = msg['body'][:500] + '... (truncated)'
-                                if 'snippet' in msg and len(msg['snippet']) > 200:
-                                    msg['snippet'] = msg['snippet'][:200] + '...'
-                        result_str = json.dumps(truncated_result, default=str)
-                    else:
+                # Issue 6 Fix: Use consistent truncation function
+                try:
+                    from main import truncate_large_result
+                    result_str = truncate_large_result(result, 4000)  # 4KB limit for audio responses
+                    
+                    original_size = len(json.dumps(result, default=str))
+                    if len(result_str) < original_size:
+                        print(f"⚠️ Truncated large result for {function_name}: {original_size} -> {len(result_str)} chars")
+                except ImportError:
+                    # Fallback to original logic if import fails
+                    result_str = json.dumps(result, default=str)
+                    if len(result_str) > 4000:
                         result_str = result_str[:4000] + '... (truncated)'
-                    print(f"⚠️ Truncated large result for {function_name}: {len(json.dumps(result, default=str))} -> {len(result_str)} chars")
+                        print(f"⚠️ Fallback truncation for {function_name}")
+                else:
+                    result_str = json.dumps(result, default=str)
                 
                 # Send result back to OpenAI
                 function_result = {
@@ -388,9 +503,19 @@ class OpenAIRealtimeProxy:
                     await self.openai_ws.send(json.dumps(function_result))
                     print(f"📤 Sent function result to OpenAI: {json.dumps(result, default=str)[:100]}...")
                     
-                    # DON'T CREATE A NEW RESPONSE! Let OpenAI handle the function result in the existing response
-                    # The original response will continue after receiving the function result
-                    print(f"✅ Function {function_name} completed - letting OpenAI continue with original response")
+                    # CRITICAL: OpenAI Realtime API requires explicit response creation after function calls
+                    # This is different from regular chat API - function calls don't automatically continue
+                    if not self.pending_audio_response:
+                        self.pending_audio_response = True
+                        audio_response = {
+                            "type": "response.create"
+                        }
+                        await self.openai_ws.send(json.dumps(audio_response))
+                        print(f"🎤 Created follow-up response for audio generation (Realtime API requirement)")
+                    else:
+                        print(f"⏳ Audio response already pending, skipping duplicate")
+                    
+                    print(f"✅ Function {function_name} completed - OpenAI will now generate audio response")
             else:
                 print(f"⚠️ Unknown function: {function_name}")
                 
@@ -431,32 +556,51 @@ class OpenAIRealtimeProxy:
         return True
     
     async def _listen_to_openai(self):
-        """Listen for messages from OpenAI"""
-        try:
-            while self.openai_ws:
-                message = await self.openai_ws.recv()
-                message_data = json.loads(message)
-                
-                # Only log essential message types to reduce noise
-                message_type = message_data.get('type', 'unknown')
-                if message_type == 'error':
-                    print(f"❌ OpenAI error: {message_type}")
-                elif message_type == 'response.created':
-                    # Check if it's a function call response
-                    response = message_data.get('response', {})
-                    if response.get('output', []):
-                        print("🎤 Creating voice response...")
-                elif message_type == 'response.done':
-                    # Only log if it's the final voice response
-                    response = message_data.get('response', {})
-                    if any(item.get('type') == 'message' for item in response.get('output', [])):
-                        print("✅ Voice response completed")
-                
-                await self.handle_openai_message(message_data)
-        except websockets.exceptions.ConnectionClosed:
-            print("🔌 OpenAI WebSocket closed")
-        except Exception as e:
-            print(f"❌ Error listening to OpenAI: {e}")
+        """Listen for messages from OpenAI with automatic reconnection"""
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            try:
+                while self.openai_ws:
+                    message = await self.openai_ws.recv()
+                    message_data = json.loads(message)
+                    
+                    # Only log essential message types to reduce noise
+                    message_type = message_data.get('type', 'unknown')
+                    if message_type == 'error':
+                        print(f"❌ OpenAI error: {message_type}")
+                    elif message_type == 'response.created':
+                        # Check if it's a function call response
+                        response = message_data.get('response', {})
+                        if response.get('output', []):
+                            print("🎤 Creating voice response...")
+                    elif message_type == 'response.done':
+                        # Only log if it's the final voice response
+                        response = message_data.get('response', {})
+                        if any(item.get('type') == 'message' for item in response.get('output', [])):
+                            print("✅ Voice response completed")
+                    
+                    await self.handle_openai_message(message_data)
+                    
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"🔌 OpenAI WebSocket closed: {e}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    print(f"🔄 Attempting to reconnect to OpenAI ({retry_count}/{max_retries})...")
+                    if await self.connect_to_openai():
+                        await self.setup_session()
+                        print("✅ OpenAI connection recovered")
+                        retry_count = 0  # Reset on successful reconnection
+                    else:
+                        await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                else:
+                    print("❌ Failed to reconnect to OpenAI after multiple attempts")
+                    break
+                    
+            except Exception as e:
+                print(f"❌ Error listening to OpenAI: {e}")
+                break
     
     async def cleanup(self):
         """Clean up connections"""

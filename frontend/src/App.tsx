@@ -1,8 +1,10 @@
-import { useEffect, useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef, useMemo, useCallback } from 'react'
 import { Toaster, toast } from 'react-hot-toast'
 import { GmailTest } from './components/GmailTest'
 import { ConnectionTest } from './components/ConnectionTest'
+import { VoiceVisualizer } from './components/VoiceVisualizer'
 import { useVoiceCapture } from './hooks/useVoiceCapture'
+import { useContinuousVoiceCapture } from './hooks/useContinuousVoiceCapture'
 import { useAudioPlayback } from './hooks/useAudioPlayback'
 
 // Extend Window interface for global WebSocket reference
@@ -11,6 +13,8 @@ declare global {
     wsRef: WebSocket | null
   }
 }
+
+type VoiceMode = 'manual' | 'hands-free'
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -22,22 +26,29 @@ function App() {
   const [isConnecting, setIsConnecting] = useState(false)
   const [authCheckInProgress, setAuthCheckInProgress] = useState(false)
   const [isAISpeaking, setIsAISpeaking] = useState(false)
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>('manual')
+  const [useWakeWord, setUseWakeWord] = useState(false) // Default to false since wake word doesn't work on HTTP
+  const [voiceStatus, setVoiceStatus] = useState<'idle' | 'listening' | 'processing' | 'active'>('idle')
   const wsRef = useRef<WebSocket | null>(null)
-  const connectionInitiated = useRef(false) // Prevent React StrictMode double-connections
+  const connectionInitiated = useRef(false)
   const awaitingAudioRef = useRef(false)
   const responseTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const sessionReadyRef = useRef(false)
+  // Issue 4 Fix: Connection state management
+  const connectionStateRef = useRef<'idle' | 'connecting' | 'connected' | 'failed'>('idle')
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const maxReconnectAttempts = useRef(3)
+  const reconnectAttempts = useRef(0)
 
-  // Voice capture hook
-  const voiceCapture = useVoiceCapture({
+  // Manual voice capture hook (push-to-talk)
+  const manualVoiceCapture = useVoiceCapture({
     onAudioData: (audioBase64: string) => {
-      // Check if we actually have audio data before sending
       if (!audioBase64 || audioBase64.length < 1000) {
         console.warn('⚠️ Audio buffer too small, skipping send:', audioBase64.length)
         toast.error('Please speak longer - audio too short')
         return
       }
       
-      // Send audio to OpenAI via WebSocket
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const audioMessage = {
           type: "input_audio_buffer.append",
@@ -46,26 +57,15 @@ function App() {
         wsRef.current.send(JSON.stringify(audioMessage))
         console.log('🎤 Sent audio data to OpenAI', audioBase64.length, 'characters')
         
-        // NOW commit the audio buffer and request response
         const commitMessage = {
           type: "input_audio_buffer.commit"
         }
         wsRef.current.send(JSON.stringify(commitMessage))
         console.log('📱 Committed audio buffer to OpenAI')
         
-        // Request OpenAI to generate a response
-        const responseMessage = {
-          type: "response.create",
-          response: {
-            modalities: ["text", "audio"],
-            instructions: "You are VoiceInbox, a helpful email assistant. Respond naturally and help the user with their Gmail tasks.",
-            voice: "alloy",
-            output_audio_format: "pcm16",
-            temperature: 0.6
-          }
-        }
-        wsRef.current.send(JSON.stringify(responseMessage))
-        console.log('🤖 Requested OpenAI response with audio output')
+        // CRITICAL FIX: Don't create response from frontend - let backend handle it
+        // The backend will automatically create response after receiving committed audio
+        console.log('✅ Audio committed - backend will handle response creation')
       } else {
         console.warn('WebSocket not connected, cannot send audio')
         toast.error('Connection lost - cannot send voice data')
@@ -90,45 +90,99 @@ function App() {
     }
   })
 
+  // Continuous voice capture hook (hands-free)
+  const continuousVoiceCapture = useContinuousVoiceCapture({
+    wsRef,
+    enableWakeWord: useWakeWord,
+    wakePhrase: "hey voiceinbox",
+    chunkDurationMs: 100,
+    isAISpeaking, // Pass AI speaking state to prevent interruptions
+    onError: (error: string) => {
+      console.error('Voice capture error:', error)
+      if (!error.includes('Wake word detection')) {
+        toast.error(`Voice error: ${error}`)
+      }
+    },
+    onStatusChange: (status) => {
+      console.log('Voice status:', status)
+      setVoiceStatus(status)
+      
+      if (status === 'active') {
+        toast('🎤 Listening for your command...', { icon: '👂', duration: 2000 })
+      } else if (status === 'listening' && useWakeWord) {
+        toast('💡 Wake word not working? Use "Activate Now" button', { icon: '💡', duration: 3000 })
+      }
+    }
+  })
+
   // Audio playback hook with stable callbacks
   const audioPlayback = useMemo(() => ({
     onPlaybackStart: () => {
       console.log('🔊 AI started speaking')
       setIsAISpeaking(true)
-      toast('🤖 AI speaking...', { icon: '🔊', duration: 30000 })
+      // Don't show toast for every audio start - it might interrupt
     },
     onPlaybackEnd: () => {
       console.log('🔊 AI finished speaking')
       setIsAISpeaking(false)
-      toast.dismiss() // Clear previous toasts
-      toast.success('AI finished speaking', { icon: '✓', duration: 2000 })
+      // Simple toast without dismissing all
+      toast.success('Response complete', { icon: '✓', duration: 1500 })
     },
     onError: (error: string) => {
       console.error('Audio playback error:', error)
       toast.error(`Audio error: ${error}`)
       setIsAISpeaking(false)
     }
-  }), []) // Empty dependency array for stable callbacks
+  }), [])
 
   const audioPlaybackHook = useAudioPlayback(audioPlayback)
 
-  // Update recording state when voice capture changes
+  // Debug: Audio test function
+  const testAudioOutput = useCallback(async () => {
+    try {
+      // Create a simple test tone
+      const audioContext = new AudioContext()
+      const duration = 0.3
+      const frequency = 440 // A4 note
+      
+      const buffer = audioContext.createBuffer(1, audioContext.sampleRate * duration, audioContext.sampleRate)
+      const data = buffer.getChannelData(0)
+      
+      for (let i = 0; i < data.length; i++) {
+        data[i] = Math.sin(2 * Math.PI * frequency * i / audioContext.sampleRate) * 0.1
+      }
+      
+      const source = audioContext.createBufferSource()
+      source.buffer = buffer
+      source.connect(audioContext.destination)
+      source.start()
+      
+      console.log('🎵 Test audio played - if you heard a beep, audio output is working')
+      toast.success('Audio test played - did you hear a beep?', { duration: 3000 })
+      
+      // Clean up
+      setTimeout(() => audioContext.close(), 1000)
+    } catch (error) {
+      console.error('Audio test failed:', error)
+      toast.error('Audio test failed - check console')
+    }
+  }, [])
+
+  // Update recording state when manual voice capture changes
   useEffect(() => {
-    setIsRecording(voiceCapture.isRecording)
-  }, [voiceCapture.isRecording])
+    if (voiceMode === 'manual') {
+      setIsRecording(manualVoiceCapture.isRecording)
+    }
+  }, [manualVoiceCapture.isRecording, voiceMode])
 
   useEffect(() => {
     if (import.meta.env.DEV) {
       console.log('🔧 App useEffect running - initializing...')
     }
     
-    // Initialize global WebSocket reference
     window.wsRef = null
-    
-    // Check authentication status
     checkAuth()
 
-    // Cleanup on unmount
     return () => {
       if (import.meta.env.DEV) {
         console.log('🧹 App useEffect cleanup running...')
@@ -136,18 +190,26 @@ function App() {
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
-        window.wsRef = null // Clear global reference
+        window.wsRef = null
       }
       
-      // Clean up response timeout
       if (responseTimeoutRef.current) {
         clearTimeout(responseTimeoutRef.current)
         responseTimeoutRef.current = null
       }
       
-      // Voice capture handles its own cleanup
+      // Issue 4 & 7 Fix: Cleanup reconnection timeout
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      
+      // Stop any active voice capture
+      if (voiceMode === 'hands-free' && continuousVoiceCapture.isListening) {
+        continuousVoiceCapture.stopListening()
+      }
     }
-  }, []) // Stable dependencies
+  }, [])
 
   const checkAuth = async () => {
     if (authCheckInProgress) {
@@ -166,13 +228,12 @@ function App() {
       if (data.email) setUserEmail(data.email)
 
       if (data.authenticated && !connectionInitiated.current) {
-        connectionInitiated.current = true // Prevent multiple connection attempts
+        connectionInitiated.current = true
         const sessionId = document.cookie
           .split('; ')
           .find((row) => row.startsWith('session_id='))
           ?.split('=')[1]
         if (sessionId) {
-          // Longer delay to ensure everything is ready and avoid React StrictMode issues
           setTimeout(() => connectWebSocket(sessionId), 1000)
         }
       }
@@ -185,54 +246,63 @@ function App() {
     }
   }
 
-  const connectWebSocket = (sessionId: string) => {
-    // Prevent multiple connections
-    if (isConnecting) {
-      console.log('Already attempting to connect, skipping...')
+  // Issue 4 Fix: Robust WebSocket connection with proper race condition handling
+  const connectWebSocket = (sessionId: string, isRetry: boolean = false) => {
+    // Prevent multiple simultaneous connections
+    if (connectionStateRef.current === 'connecting') {
+      console.log('⏳ Connection already in progress, ignoring duplicate request')
       return
     }
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      console.log('WebSocket already connected, skipping...')
+    if (connectionStateRef.current === 'connected' && wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('✅ WebSocket already connected and healthy')
       setWsConnected(true)
       return
     }
 
-    // Prevent rapid reconnection attempts
-    if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING) {
-      console.log('WebSocket already connecting, skipping...')
-      return
-    }
-
-    // Close existing connection if any
+    // Clean up any existing connection
     if (wsRef.current) {
-      console.log('Closing existing WebSocket before creating new one')
-      wsRef.current.close()
+      console.log('🧹 Cleaning up existing WebSocket connection')
+      wsRef.current.close(1000, 'Creating new connection')
       wsRef.current = null
-      window.wsRef = null // Clear global reference
+      window.wsRef = null
     }
 
+    // Clear any pending reconnect timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+
+    connectionStateRef.current = 'connecting'
     setIsConnecting(true)
     setWsConnected(false)
+    sessionReadyRef.current = false
+    
     if (import.meta.env.DEV) {
       console.log('Creating new WebSocket connection with session:', sessionId)
     }
     
     try {
       const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`)
-      wsRef.current = ws // Store reference immediately
+      wsRef.current = ws
 
       ws.onopen = () => {
-        if (import.meta.env.DEV) {
-          console.log('WebSocket connected successfully')
-        }
+        console.log('✅ WebSocket connected successfully')
+        connectionStateRef.current = 'connected'
+        reconnectAttempts.current = 0 // Reset reconnect attempts on successful connection
         setIsConnecting(false)
-        // Only set connected if WebSocket is actually open
-        if (ws.readyState === WebSocket.OPEN) {
-          setWsConnected(true)
+        setWsConnected(true)
+        window.wsRef = ws
+        
+        // CRITICAL: Set session ID in audio playback to prevent cross-contamination
+        audioPlaybackHook.setCurrentSession(sessionId)
+        console.log(`🔒 Audio session locked to: ${sessionId}`)
+        
+        if (!isRetry) {
           toast.success('Connected to Gmail service')
-          // Make WebSocket accessible for testing
-          window.wsRef = ws
+        } else {
+          toast.success('Reconnected to Gmail service')
         }
       }
 
@@ -241,38 +311,41 @@ function App() {
           const message = JSON.parse(event.data)
           const messageType = message.type
           
-          // Only log essential messages to reduce console noise
           if (import.meta.env.DEV && ['response.created', 'response.done', 'response.audio.done', 'system', 'error'].includes(messageType)) {
             console.log('WebSocket message:', message)
           }
           
-          // Handle only essential message types from OpenAI Realtime API
+          // Mark session as ready when we get the confirmation
+          if (messageType === 'system' && message.message?.includes('OpenAI session ready')) {
+            sessionReadyRef.current = true
+            console.log('✅ OpenAI session is ready')
+          }
+          
           if (messageType === 'response.created') {
             if (import.meta.env.DEV) {
               console.log('🚀 OpenAI response started')
             }
-            // Clear any previous audio to ensure clean playback
+            // Only clear queue if there's existing audio to prevent overlap
+            if (isAISpeaking) {
+              audioPlaybackHook.stopPlayback()
+            }
             audioPlaybackHook.clearQueue()
-            
-            // Start tracking for audio response
             awaitingAudioRef.current = true
             
-            // Set timeout to detect no-audio responses
             if (responseTimeoutRef.current) {
               clearTimeout(responseTimeoutRef.current)
             }
             responseTimeoutRef.current = setTimeout(() => {
               if (awaitingAudioRef.current && !isAISpeaking) {
-                console.log('⚠️ No audio received from OpenAI - text-only response')
-                toast('AI responded with text only - try asking again', { icon: '💬', duration: 3000 })
+                console.log('⚠️ No audio received from OpenAI within 5 seconds')
+                // Check if OpenAI response was completed without audio
+                toast('OpenAI gave text-only response. Try asking a simpler question.', { icon: '💬', duration: 4000 })
                 awaitingAudioRef.current = false
               }
-            }, 3000) // 3 second timeout to detect no-audio responses
+            }, 5000) // 5 second timeout for audio
             
           } else if (messageType === 'response.audio.delta') {
-            // Handle audio response chunks from OpenAI - MOST IMPORTANT
             if (message.delta) {
-              // Clear awaiting audio flag since we're receiving audio
               if (awaitingAudioRef.current) {
                 awaitingAudioRef.current = false
                 if (responseTimeoutRef.current) {
@@ -281,7 +354,6 @@ function App() {
                 }
               }
               audioPlaybackHook.addAudioChunk(message.delta)
-              // Don't log individual chunks - too noisy
             }
             
           } else if (messageType === 'response.audio.done') {
@@ -295,15 +367,18 @@ function App() {
               console.log('✅ OpenAI response complete')
             }
             
-            // Clean up no-audio detection timeout
             if (responseTimeoutRef.current) {
               clearTimeout(responseTimeoutRef.current)
               responseTimeoutRef.current = null
             }
             awaitingAudioRef.current = false
             
+            // Log the full response for debugging
+            if (message.response && import.meta.env.DEV) {
+              console.log('Full response:', message.response)
+            }
+            
           } else if (messageType === 'system') {
-            // Handle system messages (like fallback mode)
             toast(message.message, { icon: 'ℹ️' })
             
           } else if (messageType === 'error' && !message.function) {
@@ -311,7 +386,6 @@ function App() {
             toast.error(`OpenAI Error: ${message.error?.message || 'Unknown error'}`)
           }
           
-          // Handle function result messages (for testing)
           if (messageType === 'function_result') {
             console.log('Function result:', message.function, message.result)
           }
@@ -320,38 +394,73 @@ function App() {
         }
       }
 
+      // Issue 7 Fix: Enhanced onclose with automatic reconnection
       ws.onclose = (event) => {
-        console.log('WebSocket disconnected:', event.code, event.reason)
+        console.log('🔌 WebSocket disconnected:', event.code, event.reason)
         
-        // Only update state if this is still the current WebSocket
         if (wsRef.current === ws) {
+          connectionStateRef.current = 'idle'
           setWsConnected(false)
           setIsConnecting(false)
           wsRef.current = null
           window.wsRef = null
+          sessionReadyRef.current = false
+          
+          // Stop hands-free listening when disconnected
+          if (voiceMode === 'hands-free' && continuousVoiceCapture.isListening) {
+            continuousVoiceCapture.stopListening()
+          }
         }
         
+        // Handle different disconnection scenarios
         if (event.code === 4001) {
           toast.error('Invalid session - please login again')
+          connectionStateRef.current = 'failed'
         } else if (event.code === 4002) {
           console.log('Another connection was already active')
-        } else if (event.code !== 1000 && event.code !== 1001) { // 1000 = normal, 1001 = going away
-          // Don't show error toast for normal closure or development reconnections
-          if (event.code !== 1006 || !import.meta.env.DEV) {
-            toast.error('Disconnected from Gmail service')
+        } else if (event.code !== 1000 && event.code !== 1001) {
+          // Unexpected disconnection - attempt reconnection
+          if (reconnectAttempts.current < maxReconnectAttempts.current) {
+            reconnectAttempts.current++
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current - 1), 10000) // Exponential backoff
+            
+            console.log(`🔄 Attempting reconnection ${reconnectAttempts.current}/${maxReconnectAttempts.current} in ${delay}ms`)
+            toast(`Connection lost. Reconnecting... (${reconnectAttempts.current}/${maxReconnectAttempts.current})`, { icon: '🔄', duration: 3000 })
+            
+            reconnectTimeoutRef.current = setTimeout(() => {
+              const sessionId = document.cookie
+                .split('; ')
+                .find((row) => row.startsWith('session_id='))
+                ?.split('=')[1]
+              
+              if (sessionId) {
+                connectWebSocket(sessionId, true)
+              }
+            }, delay)
+          } else {
+            toast.error('Connection failed after multiple attempts. Please reload the page.')
+            connectionStateRef.current = 'failed'
           }
         }
       }
 
+      // Issue 7 Fix: Enhanced onerror with recovery
       ws.onerror = (error) => {
-        console.error('WebSocket error:', error)
+        console.error('❌ WebSocket error:', error)
+        connectionStateRef.current = 'failed'
         setWsConnected(false)
         setIsConnecting(false)
+        
         if (wsRef.current === ws) {
           wsRef.current = null
-          window.wsRef = null // Clear global reference
+          window.wsRef = null
+          sessionReadyRef.current = false
         }
-        toast.error('Failed to connect to Gmail service')
+        
+        // Don't show error toast if we're going to try reconnecting
+        if (reconnectAttempts.current >= maxReconnectAttempts.current) {
+          toast.error('Failed to connect to Gmail service')
+        }
       }
     } catch (error) {
       console.error('Failed to create WebSocket:', error)
@@ -367,21 +476,24 @@ function App() {
 
   const handleLogout = async () => {
     try {
-      // Clean up WebSocket first
       connectionInitiated.current = false
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
-        window.wsRef = null // Clear global reference
+        window.wsRef = null
       }
       setWsConnected(false)
       setIsConnecting(false)
+      
+      // Stop any active voice capture
+      if (voiceMode === 'hands-free' && continuousVoiceCapture.isListening) {
+        continuousVoiceCapture.stopListening()
+      }
       
       await fetch('/api/auth/logout', {
         method: 'POST',
         credentials: 'include'
       })
-      // Reload page to clear state
       window.location.reload()
     } catch (error) {
       console.error('Logout failed:', error)
@@ -397,11 +509,11 @@ function App() {
     }
 
     console.log('Force reconnecting WebSocket...')
-    connectionInitiated.current = false // Reset the flag
+    connectionInitiated.current = false
     if (wsRef.current) {
       wsRef.current.close()
       wsRef.current = null
-      window.wsRef = null // Clear global reference
+      window.wsRef = null
     }
     setWsConnected(false)
     setIsConnecting(false)
@@ -420,73 +532,127 @@ function App() {
     }
   }
 
-  // Voice recording handlers
+  // Manual voice recording handlers
   const handleStartRecording = async () => {
     if (!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       toast.error('Please connect to Gmail service first')
       return
     }
     
-    // Prevent recording if AI is speaking
+    // Wait for session to be ready
+    if (!sessionReadyRef.current) {
+      toast('Waiting for session...', { icon: '⏳' })
+      // Wait up to 2 seconds for session
+      let waited = 0
+      while (!sessionReadyRef.current && waited < 2000) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        waited += 100
+      }
+      if (!sessionReadyRef.current) {
+        toast.error('Session not ready, please try again')
+        return
+      }
+    }
+    
     if (isAISpeaking) {
       console.log('AI is speaking, cannot start recording')
-      toast.error('Please wait for AI to finish speaking')
+      toast('Please wait for AI to finish speaking', { icon: '⏳', duration: 2000 })
       return
     }
     
-    // Prevent double-start
-    if (isRecording || voiceCapture.isRecording) {
+    if (isRecording || manualVoiceCapture.isRecording) {
       console.log('Already recording, ignoring start request')
       return
     }
     
-    // Check microphone support
-    if (!voiceCapture.isSupported) {
+    if (!manualVoiceCapture.isSupported) {
       toast.error('Microphone not supported in this browser')
       return
     }
     
-    // Stop any ongoing audio playback first
-    audioPlaybackHook.stopPlayback()
+    // Don't stop playback here - let it finish naturally
+    // audioPlaybackHook.stopPlayback()
     
-    // Initialize audio playback context on user gesture (required by browsers)
     try {
       if (!audioPlaybackHook.isSupported) {
         console.log('🔊 Initializing audio playback on user gesture...')
-        // This will create AudioContext after user interaction
       }
     } catch (error) {
       console.warn('Audio playback initialization warning:', error)
     }
     
-    // Request permission if needed
-    if (voiceCapture.permissionStatus === 'prompt') {
-      const granted = await voiceCapture.requestPermission()
+    if (manualVoiceCapture.permissionStatus === 'prompt') {
+      const granted = await manualVoiceCapture.requestPermission()
       if (!granted) {
         toast.error('Microphone permission required for voice commands')
         return
       }
     }
     
-    if (voiceCapture.permissionStatus === 'denied') {
+    if (manualVoiceCapture.permissionStatus === 'denied') {
       toast.error('Microphone permission denied')
       return
     }
     
-    // Start recording
-    await voiceCapture.startRecording()
+    await manualVoiceCapture.startRecording()
   }
 
   const handleStopRecording = () => {
-    // Prevent double-stop and only stop if actually recording
-    if (!isRecording && !voiceCapture.isRecording) {
+    if (!isRecording && !manualVoiceCapture.isRecording) {
       console.log('Not recording, ignoring stop request')
       return
     }
     
-    voiceCapture.stopRecording()
-    // The commit and response.create are now sent in onAudioData callback
-    // after the audio is actually processed and sent
+    manualVoiceCapture.stopRecording()
+  }
+
+  // Hands-free voice handlers
+  const handleToggleHandsFree = async () => {
+    if (!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      toast.error('Please connect to Gmail service first')
+      return
+    }
+    
+    if (!continuousVoiceCapture.isSupported) {
+      toast.error('Microphone not supported in this browser')
+      return
+    }
+    
+    if (continuousVoiceCapture.permissionStatus === 'prompt') {
+      const granted = await continuousVoiceCapture.requestPermission()
+      if (!granted) {
+        toast.error('Microphone permission required for voice commands')
+        return
+      }
+    }
+    
+    if (continuousVoiceCapture.permissionStatus === 'denied') {
+      toast.error('Microphone permission denied')
+      return
+    }
+    
+    if (continuousVoiceCapture.isListening) {
+      continuousVoiceCapture.stopListening()
+      toast('🔇 Voice capture stopped', { icon: '🛑', duration: 2000 })
+    } else {
+      await continuousVoiceCapture.startListening()
+      if (!useWakeWord) {
+        toast('🎤 Voice capture active - speak naturally', { icon: '🎤', duration: 3000 })
+      }
+    }
+  }
+
+  // Switch voice mode
+  const handleSwitchMode = (newMode: VoiceMode) => {
+    if (newMode === voiceMode) return
+    
+    // Stop current mode
+    if (voiceMode === 'hands-free' && continuousVoiceCapture.isListening) {
+      continuousVoiceCapture.stopListening()
+    }
+    
+    setVoiceMode(newMode)
+    toast(`Switched to ${newMode} mode`, { icon: '🔄', duration: 2000 })
   }
 
   if (loading) {
@@ -531,6 +697,12 @@ function App() {
               >
                 {showTests ? 'Hide' : 'Show'} Tests
               </button>
+              <button
+                onClick={testAudioOutput}
+                className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 border border-blue-300 rounded"
+              >
+                🔊 Test Audio
+              </button>
               {(!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) && !isConnecting && (
                 <button
                   onClick={forceReconnect}
@@ -574,96 +746,234 @@ function App() {
             </div>
           ) : (
             <div className="flex items-center justify-center h-full">
-              <div className="text-center">
-                <p className="text-gray-600 mb-8">
-                  {isConnecting 
-                    ? 'Connecting to Gmail service...' 
-                    : isAISpeaking
-                    ? '🤖 AI is responding... Please wait.'
-                    : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
-                      ? '🎤 Ready for voice commands! Press and hold to talk.'
-                      : 'Connection lost - click Reconnect'
-                  }
+              <div className="text-center space-y-6">
+                {/* Voice Mode Selector */}
+                <div className="flex justify-center gap-2 mb-8">
+                  <button
+                    onClick={() => handleSwitchMode('manual')}
+                    className={`px-4 py-2 rounded-lg font-medium transition ${
+                      voiceMode === 'manual'
+                        ? 'bg-blue-500 text-white'
+                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                    }`}
+                  >
+                    🎤 Push to Talk
+                  </button>
+                  <button
+                    onClick={() => handleSwitchMode('hands-free')}
+                    className={`px-4 py-2 rounded-lg font-medium transition ${
+                      voiceMode === 'hands-free'
+                        ? 'bg-blue-500 text-white'
+                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                    }`}
+                  >
+                    🤲 Hands-Free
+                  </button>
+                </div>
+
+                {/* Status Display */}
+                <div className="mb-8">
+                  <p className="text-gray-600 mb-2">
+                    {isConnecting 
+                      ? 'Connecting to Gmail service...' 
+                      : isAISpeaking
+                      ? '🤖 AI is responding...'
+                      : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
+                        ? voiceMode === 'manual'
+                          ? isRecording
+                            ? '🎤 Recording... Release to send'
+                            : '🎤 Ready - Hold button to speak'
+                          : continuousVoiceCapture.isListening
+                            ? voiceStatus === 'active' || !useWakeWord
+                              ? '🎤 Listening for your command...'
+                              : '👂 Click "Activate Now" to start speaking'
+                            : '🔇 Voice capture inactive - click to start'
+                        : 'Connection lost - click Reconnect'
+                    }
+                  </p>
                   {import.meta.env.DEV && (
                     <span className="text-xs text-gray-400 block mt-1">
-                      WS State: {wsRef.current ? wsRef.current.readyState : 'null'} | Connected: {wsConnected.toString()} | Connecting: {isConnecting.toString()}
+                      Mode: {voiceMode} | WS: {wsRef.current ? wsRef.current.readyState : 'null'} | 
+                      {voiceMode === 'hands-free' && ` Status: ${voiceStatus} | Muted: ${continuousVoiceCapture.isMuted}`}
                     </span>
                   )}
-                </p>
+                </div>
 
-                {/* Push-to-talk button */}
-                <button
-                  onMouseDown={(e) => {
-                    e.preventDefault()
-                    handleStartRecording()
-                  }}
-                  onMouseUp={(e) => {
-                    e.preventDefault()
-                    handleStopRecording()
-                  }}
-                  onMouseLeave={(e) => {
-                    e.preventDefault()
-                    // Stop recording if mouse leaves button while held down
-                    if (isRecording || voiceCapture.isRecording) {
-                      handleStopRecording()
-                    }
-                  }}
-                  onTouchStart={(e) => {
-                    e.preventDefault()
-                    handleStartRecording()
-                  }}
-                  onTouchEnd={(e) => {
-                    e.preventDefault()
-                    handleStopRecording()
-                  }}
-                  disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !voiceCapture.isSupported || isAISpeaking}
-                  className={
-                    `w-32 h-32 rounded-full transition-all duration-200 ` +
-                    (isRecording
-                      ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
-                      : isAISpeaking
-                      ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
-                      : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && voiceCapture.isSupported)
-                      ? 'bg-blue-500 hover:bg-blue-600 shadow'
-                      : 'bg-gray-300 cursor-not-allowed')
-                  }
-                >
-                  {isAISpeaking ? (
-                    // Speaker icon when AI is speaking
-                    <svg
-                      className="w-12 h-12 mx-auto text-white"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
+                {/* Voice Control */}
+                {voiceMode === 'manual' ? (
+                  // Manual Push-to-Talk Interface
+                  <div className="space-y-4">
+                    <button
+                      onMouseDown={(e) => {
+                        e.preventDefault()
+                        handleStartRecording()
+                      }}
+                      onMouseUp={(e) => {
+                        e.preventDefault()
+                        handleStopRecording()
+                      }}
+                      onMouseLeave={(e) => {
+                        e.preventDefault()
+                        if (isRecording || manualVoiceCapture.isRecording) {
+                          handleStopRecording()
+                        }
+                      }}
+                      onTouchStart={(e) => {
+                        e.preventDefault()
+                        handleStartRecording()
+                      }}
+                      onTouchEnd={(e) => {
+                        e.preventDefault()
+                        handleStopRecording()
+                      }}
+                      disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !manualVoiceCapture.isSupported || isAISpeaking}
+                      className={
+                        `w-32 h-32 rounded-full transition-all duration-200 ` +
+                        (isRecording
+                          ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
+                          : isAISpeaking
+                          ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
+                          : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && manualVoiceCapture.isSupported)
+                          ? 'bg-blue-500 hover:bg-blue-600 shadow'
+                          : 'bg-gray-300 cursor-not-allowed')
+                      }
                     >
-                      <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
-                    </svg>
-                  ) : (
-                    // Microphone icon when ready to record
-                    <svg
-                      className="w-12 h-12 mx-auto text-white"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                      <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-                    </svg>
-                  )}
-                </button>
+                      {isAISpeaking ? (
+                        <svg
+                          className="w-12 h-12 mx-auto text-white"
+                          fill="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                        </svg>
+                      ) : (
+                        <svg
+                          className="w-12 h-12 mx-auto text-white"
+                          fill="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                        </svg>
+                      )}
+                    </button>
 
-                <p className="mt-4 text-xs text-gray-500">
-                  {!voiceCapture.isSupported 
-                    ? 'Microphone not supported in this browser'
-                    : voiceCapture.permissionStatus === 'denied'
-                    ? 'Microphone permission denied - please allow access'
-                    : isAISpeaking
-                    ? '🤖 AI is speaking - please wait for response to finish'
-                    : isRecording 
-                    ? '🎤 Listening... Release to stop'
-                    : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN)
-                    ? 'Hold to talk with VoiceInbox'
-                    : 'Connect to Gmail service first'
-                  }
-                </p>
+                    <p className="mt-4 text-xs text-gray-500">
+                      {!manualVoiceCapture.isSupported 
+                        ? 'Microphone not supported in this browser'
+                        : manualVoiceCapture.permissionStatus === 'denied'
+                        ? 'Microphone permission denied - please allow access'
+                        : isAISpeaking
+                        ? '🤖 AI is speaking - please wait'
+                        : isRecording 
+                        ? '🎤 Listening... Release to stop'
+                        : 'Hold to talk with VoiceInbox'
+                      }
+                    </p>
+                  </div>
+                ) : (
+                  // ChatGPT-Style Hands-Free Interface
+                  <div className="space-y-8">
+                    {/* Advanced Voice Visualizer */}
+                    <VoiceVisualizer 
+                      status={isAISpeaking ? 'speaking' : voiceStatus}
+                      isActive={continuousVoiceCapture.isActive}
+                      isMuted={continuousVoiceCapture.isMuted}
+                    />
+
+                    {/* Control buttons */}
+                    <div className="flex justify-center gap-4">
+                      {/* Main toggle button */}
+                      <button
+                        onClick={handleToggleHandsFree}
+                        disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !continuousVoiceCapture.isSupported}
+                        className={
+                          `px-6 py-3 rounded-xl font-medium transition-all duration-200 shadow-lg ` +
+                          (continuousVoiceCapture.isListening
+                            ? 'bg-red-500 text-white hover:bg-red-600'
+                            : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && continuousVoiceCapture.isSupported)
+                            ? 'bg-green-500 text-white hover:bg-green-600 hover:scale-105'
+                            : 'bg-gray-300 text-gray-500 cursor-not-allowed')
+                        }
+                      >
+                        {continuousVoiceCapture.isListening ? '🛑 Stop Listening' : '🎤 Start Voice Mode'}
+                      </button>
+
+                      {/* Secondary controls */}
+                      {continuousVoiceCapture.isListening && (
+                        <>
+                          <button
+                            onClick={continuousVoiceCapture.toggleMute}
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 shadow ${
+                              continuousVoiceCapture.isMuted
+                                ? 'bg-red-500 text-white hover:bg-red-600'
+                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                            }`}
+                          >
+                            {continuousVoiceCapture.isMuted ? '🔇 Unmute' : '🔊 Mute'}
+                          </button>
+                          
+                          {useWakeWord && voiceStatus === 'listening' && (
+                            <button
+                              onClick={continuousVoiceCapture.activateManually}
+                              className="px-4 py-2 rounded-lg text-sm font-medium bg-green-500 text-white hover:bg-green-600 transition-all duration-200 shadow animate-pulse"
+                            >
+                              🎯 Activate Now
+                            </button>
+                          )}
+                        </>
+                      )}
+                      
+                      <button
+                        onClick={() => {
+                          setUseWakeWord(!useWakeWord)
+                          if (continuousVoiceCapture.isListening && !useWakeWord) {
+                            continuousVoiceCapture.stopListening()
+                            setTimeout(() => continuousVoiceCapture.startListening(), 100)
+                          }
+                        }}
+                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 shadow ${
+                          useWakeWord
+                            ? 'bg-yellow-500 text-white hover:bg-yellow-600'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                      >
+                        {useWakeWord ? '🎯 Manual Mode' : '🎤 Always Active'}
+                      </button>
+                    </div>
+
+                    {/* Help text */}
+                    <div className="text-center max-w-md mx-auto">
+                      <p className="text-sm text-gray-500 leading-relaxed">
+                        {!continuousVoiceCapture.isSupported 
+                          ? 'Microphone not supported in this browser'
+                          : continuousVoiceCapture.permissionStatus === 'denied'
+                          ? 'Microphone permission denied - please allow access'
+                          : isAISpeaking
+                          ? '🤖 I\'m responding to your question...'
+                          : continuousVoiceCapture.isListening
+                          ? useWakeWord
+                            ? voiceStatus === 'active'
+                              ? '🎤 I\'m listening! Speak naturally for up to 30 seconds.'
+                              : '💡 Say "hey voiceinbox" or click "Activate Now" to start speaking'
+                            : '🎤 Voice mode active - I\'m listening for your commands'
+                          : 'Click "Start Voice Mode" to begin hands-free interaction'
+                        }
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Visual Indicator for hands-free mode */}
+                {voiceMode === 'hands-free' && continuousVoiceCapture.isListening && (
+                  <div className="flex justify-center items-center gap-1 mt-4">
+                    <div className={`w-2 h-8 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '0ms' }}></div>
+                    <div className={`w-2 h-12 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '150ms' }}></div>
+                    <div className={`w-2 h-16 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '300ms' }}></div>
+                    <div className={`w-2 h-12 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '450ms' }}></div>
+                    <div className={`w-2 h-8 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '600ms' }}></div>
+                  </div>
+                )}
               </div>
             </div>
           )}

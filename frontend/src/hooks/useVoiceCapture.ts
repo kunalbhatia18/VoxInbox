@@ -60,11 +60,16 @@ export const useVoiceCapture = ({
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null)
-  const processorNodeRef = useRef<ScriptProcessorNode | null>(null)
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null)
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null) // Fallback
   const audioBufferRef = useRef<Float32Array[]>([])
   const isProcessingRef = useRef(false)
+  const workletLoadedRef = useRef(false)
+  const useWorkletRef = useRef(false)
+  // Fix: Track AudioContext instance to prevent scope issues
+  const audioContextInstanceRef = useRef<number>(0)
   
-  // Check browser support
+  // Check browser support including AudioWorklet
   const checkSupport = useCallback(() => {
     const hasGetUserMedia =
       typeof navigator !== 'undefined' &&
@@ -75,8 +80,19 @@ export const useVoiceCapture = ({
       typeof window !== 'undefined' &&
       (!!window.AudioContext || !!(window as any).webkitAudioContext)
 
+    const hasAudioWorklet = hasAudioContext && 
+      typeof AudioContext !== 'undefined' &&
+      'audioWorklet' in AudioContext.prototype
+
     const supported = hasGetUserMedia && hasAudioContext
     setIsSupported(supported)
+    
+    if (hasAudioWorklet) {
+      console.log('🎧 AudioWorklet supported - using modern audio processing')
+    } else {
+      console.warn('⚠️ AudioWorklet not supported - falling back to deprecated ScriptProcessor')
+    }
+    
     return supported
   }, [])
   
@@ -91,7 +107,7 @@ export const useVoiceCapture = ({
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
-          sampleRate: 24000, // REVERTED: Must match OpenAI requirements
+          sampleRate: 48000,  // FIXED: Match everything else at 48kHz
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
@@ -107,8 +123,41 @@ export const useVoiceCapture = ({
       return false
     }
   }, [checkSupport, onError])
+
+  // Fallback recording using deprecated ScriptProcessor
+  const startRecordingFallback = useCallback(async (stream: MediaStream, audioContext: AudioContext) => {
+    console.log('🔄 Using fallback ScriptProcessor for audio recording')
+    
+    const source = audioContext.createMediaStreamSource(stream)
+    // @ts-ignore - ScriptProcessorNode is deprecated but still works
+    const processor = audioContext.createScriptProcessor(4096, 1, 1)
+    
+    sourceNodeRef.current = source
+    processorNodeRef.current = processor
+    
+    // Clear previous buffer
+    audioBufferRef.current = []
+    
+    // Set up audio processing
+    // @ts-ignore - onaudioprocess is deprecated but still works
+    processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      if (!isProcessingRef.current) return
+      
+      // @ts-ignore - inputBuffer is deprecated but still works
+      const inputData = e.inputBuffer.getChannelData(0)
+      const buffer = new Float32Array(inputData.length)
+      buffer.set(inputData)
+      audioBufferRef.current.push(buffer)
+    }
+    
+    // Connect nodes
+    source.connect(processor)
+    processor.connect(audioContext.destination)
+    
+    useWorkletRef.current = false
+  }, [])
   
-  // Start recording
+  // Start recording with AudioWorklet (with fallback)
   const startRecording = useCallback(async () => {
     if (isRecording || isProcessingRef.current) {
       console.log('Already recording or processing')
@@ -135,7 +184,7 @@ export const useVoiceCapture = ({
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: 24000, // REVERTED: Must match OpenAI requirements
+            sampleRate: 48000,  // FIXED: Match AudioContext sample rate
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
@@ -143,51 +192,99 @@ export const useVoiceCapture = ({
         })
       } catch (e) {
         console.warn('Failed with ideal constraints, trying fallback')
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        })
       }
       
       mediaStreamRef.current = stream
       
-      // Create audio context
+      // Create audio context - always create fresh context to avoid scope issues
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
-      const audioContext = new AudioContextClass()
-      audioContextRef.current = audioContext
       
-      // Create nodes
-      const source = audioContext.createMediaStreamSource(stream)
-      // TODO: Migrate to AudioWorklet when stable across all browsers
-      // @ts-ignore - ScriptProcessorNode is deprecated but still works
-      const processor = audioContext.createScriptProcessor(4096, 1, 1)
-      
-      sourceNodeRef.current = source
-      processorNodeRef.current = processor
-      
-      // Clear previous buffer
-      audioBufferRef.current = []
-      
-      // Set up audio processing
-      // @ts-ignore - onaudioprocess is deprecated but still works
-      processor.onaudioprocess = (e: AudioProcessingEvent) => {
-        if (!isProcessingRef.current) return
-        
-        // @ts-ignore - inputBuffer is deprecated but still works
-        const inputData = e.inputBuffer.getChannelData(0)
-        const buffer = new Float32Array(inputData.length)
-        buffer.set(inputData)
-        audioBufferRef.current.push(buffer)
+      // Always create a new AudioContext to avoid AudioWorklet scope issues
+      if (audioContextRef.current) {
+        console.log('🔄 Closing previous AudioContext to create fresh one')
+        try {
+          await audioContextRef.current.close()
+        } catch (e) {
+          console.warn('Error closing previous AudioContext:', e)
+        }
+        audioContextRef.current = null
+        workletLoadedRef.current = false // Reset worklet loaded state
       }
       
-      // Connect nodes
-      source.connect(processor)
-      processor.connect(audioContext.destination)
+      // CRITICAL FIX: Force 48kHz AudioContext for voice capture
+      audioContextRef.current = new AudioContextClass({
+        sampleRate: 48000,  // Force 48kHz to match audio playback
+        latencyHint: 'interactive'
+      })
+      audioContextInstanceRef.current++
+      const currentInstance = audioContextInstanceRef.current
       
-      // Resume context if needed
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume()
+      // IMPORTANT: Ensure audio context is ready before processing
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume()
+        console.log('🎧 Audio context resumed before recording')
+      }
+      
+      // Try to use AudioWorklet first - always reload module for fresh context
+      const hasAudioWorklet = 'audioWorklet' in audioContextRef.current
+      if (hasAudioWorklet) {
+        try {
+          // Always reload the AudioWorklet module for fresh AudioContext
+          await audioContextRef.current.audioWorklet.addModule('/worklets/voice-processor.js')
+          workletLoadedRef.current = true
+          console.log('📡 AudioWorklet loaded successfully for fresh context')
+        } catch (error) {
+          console.warn('⚠️ AudioWorklet failed to load:', error)
+          workletLoadedRef.current = false
+        }
+      }
+      
+      if (hasAudioWorklet && workletLoadedRef.current) {
+        // Use modern AudioWorklet
+        const source = audioContextRef.current.createMediaStreamSource(stream)
+        const workletNode = new AudioWorkletNode(audioContextRef.current, 'voice-processor')
+        
+        sourceNodeRef.current = source
+        workletNodeRef.current = workletNode
+        
+        // Clear previous buffer
+        audioBufferRef.current = []
+        
+        // Set up audio processing via worklet messages
+        workletNode.port.onmessage = (event) => {
+          if (event.data.type === 'audioData' && isProcessingRef.current) {
+            // Check if this is still the current context instance
+            if (audioContextInstanceRef.current === currentInstance) {
+              audioBufferRef.current.push(new Float32Array(event.data.buffer))
+            }
+          }
+        }
+        
+        // Activate the worklet
+        workletNode.port.postMessage({ type: 'setActive', active: true })
+        
+        // Connect nodes (worklet doesn't need to connect to destination)
+        source.connect(workletNode)
+        
+        useWorkletRef.current = true
+        console.log('🎧 Recording started with AudioWorklet (fresh context)')
+      } else {
+        // Fallback to deprecated ScriptProcessor
+        await startRecordingFallback(stream, audioContextRef.current)
+        console.log('🎧 Recording started with ScriptProcessor (fallback)')
       }
       
       setIsRecording(true)
-      console.log('🎤 Recording started')
+      
+      // Small delay to ensure first buffer is captured
+      await new Promise(resolve => setTimeout(resolve, 100))
       
     } catch (error) {
       console.error('Error starting recording:', error)
@@ -196,7 +293,7 @@ export const useVoiceCapture = ({
       isProcessingRef.current = false
       cleanup()
     }
-  }, [isRecording, permissionStatus, requestPermission, onError, onStatusChange])
+  }, [isRecording, permissionStatus, requestPermission, onError, onStatusChange, startRecordingFallback])
   
   // Stop recording
   const stopRecording = useCallback(() => {
@@ -210,8 +307,14 @@ export const useVoiceCapture = ({
     onStatusChange?.('processing')
     
     try {
-      // Disconnect nodes
-      if (sourceNodeRef.current && processorNodeRef.current) {
+      // Disconnect nodes based on what was used
+      if (useWorkletRef.current && sourceNodeRef.current && workletNodeRef.current) {
+        // Deactivate worklet first
+        workletNodeRef.current.port.postMessage({ type: 'setActive', active: false })
+        sourceNodeRef.current.disconnect()
+        workletNodeRef.current.disconnect()
+      } else if (sourceNodeRef.current && processorNodeRef.current) {
+        // Fallback cleanup
         sourceNodeRef.current.disconnect()
         processorNodeRef.current.disconnect()
       }
@@ -230,8 +333,9 @@ export const useVoiceCapture = ({
           offset += buffer.length
         }
         
-        // Resample to 24kHz if needed (REVERTED: Must match OpenAI requirements)
-        const resampled = resampleAudio(combined, sampleRate, 24000)
+        // Resample to 24kHz if needed (OpenAI expects 24kHz)
+        const resampled = sampleRate === 24000 ? combined : resampleAudio(combined, sampleRate, 24000)
+        console.log(`🎤 Voice resampled: ${sampleRate}Hz → 24kHz for OpenAI`)
         
         // Convert to PCM16
         const pcm16 = floatTo16BitPCM(resampled)
@@ -271,6 +375,7 @@ export const useVoiceCapture = ({
     }
     
     sourceNodeRef.current = null
+    workletNodeRef.current = null
     processorNodeRef.current = null
     audioBufferRef.current = []
   }, [])
