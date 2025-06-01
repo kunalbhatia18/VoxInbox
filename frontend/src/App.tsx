@@ -2,7 +2,6 @@ import { useEffect, useState, useRef, useMemo, useCallback } from 'react'
 import { Toaster, toast } from 'react-hot-toast'
 import { GmailTest } from './components/GmailTest'
 import { ConnectionTest } from './components/ConnectionTest'
-import { VoiceVisualizer } from './components/VoiceVisualizer'
 import { useVoiceCapture } from './hooks/useVoiceCapture'
 import { useContinuousVoiceCapture } from './hooks/useContinuousVoiceCapture'
 import { useAudioPlayback } from './hooks/useAudioPlayback'
@@ -28,7 +27,7 @@ function App() {
   const [isAISpeaking, setIsAISpeaking] = useState(false)
   const [isProcessingRequest, setIsProcessingRequest] = useState(false) // Prevent concurrent requests
   const lastRequestTimeRef = useRef<number>(0) // Debounce requests
-  const [voiceMode, setVoiceMode] = useState<VoiceMode>('manual')
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>('hands-free')
   const [useWakeWord, setUseWakeWord] = useState(false) // Default to false since wake word doesn't work on HTTP
   const [voiceStatus, setVoiceStatus] = useState<'idle' | 'listening' | 'processing' | 'active'>('idle')
   const wsRef = useRef<WebSocket | null>(null)
@@ -253,7 +252,8 @@ function App() {
     setAuthCheckInProgress(true)
     
     try {
-      const response = await fetch('/api/auth/status', {
+      const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || ''
+      const response = await fetch(`${apiBaseUrl}/api/auth/status`, {
         credentials: 'include',
       })
       const data = await response.json()
@@ -317,7 +317,9 @@ function App() {
     }
     
     try {
-      const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`)
+      // Use environment variables for WebSocket URL
+      const wsBaseUrl = import.meta.env.VITE_WS_BASE_URL || 'ws://localhost:8000'
+      const ws = new WebSocket(`${wsBaseUrl}/ws/${sessionId}`)
       wsRef.current = ws
 
       ws.onopen = () => {
@@ -352,6 +354,8 @@ function App() {
           if (messageType === 'system' && message.message?.includes('OpenAI session ready')) {
             sessionReadyRef.current = true
             console.log('✅ OpenAI session is ready')
+            // Don't show toast for session ready message
+            return
           }
           
           if (messageType === 'response.created') {
@@ -543,7 +547,8 @@ function App() {
   }
 
   const handleLogin = () => {
-    window.location.href = '/api/login'
+    const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || ''
+    window.location.href = `${apiBaseUrl}/api/login`
   }
 
   const handleLogout = async () => {
@@ -562,7 +567,8 @@ function App() {
         continuousVoiceCapture.stopListening()
       }
       
-      await fetch('/api/auth/logout', {
+      const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || ''
+      await fetch(`${apiBaseUrl}/api/auth/logout`, {
         method: 'POST',
         credentials: 'include'
       })
@@ -736,24 +742,29 @@ function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="text-gray-600">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-900 font-['Inter',system-ui,sans-serif]">
+        <div className="text-gray-400">Loading...</div>
       </div>
     )
   }
 
   if (!isAuthenticated) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="text-center">
-          <h1 className="text-3xl font-bold text-gray-900 mb-4">VoiceInbox MVP</h1>
-          <p className="text-gray-600 mb-2">Process your inbox with just your voice</p>
-          <p className="text-sm text-gray-500 mb-8">
-            "What if we could all arrive at work each day already at Inbox Zero?"
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-gray-900 via-black to-gray-900 font-['Inter',system-ui,sans-serif]">
+        <div className="text-center max-w-sm mx-auto px-6">
+          <div className="w-16 h-16 bg-gradient-to-r from-blue-400 to-purple-500 rounded-2xl flex items-center justify-center mx-auto mb-8">
+            <svg className="w-8 h-8 text-white" fill="white" viewBox="0 0 24 24">
+              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+            </svg>
+          </div>
+          <h1 className="text-3xl font-medium text-white mb-4">VoiceInbox</h1>
+          <p className="text-gray-400 mb-8 leading-relaxed">
+            Process your inbox with just your voice
           </p>
           <button
             onClick={handleLogin}
-            className="bg-blue-500 text-white px-6 py-3 rounded-lg font-medium hover:bg-blue-600 transition"
+            className="w-full bg-gradient-to-r from-blue-500 to-blue-600 text-white px-6 py-3 rounded-xl font-medium hover:from-blue-600 hover:to-blue-700 transition-all duration-200 shadow-lg hover:shadow-xl"
           >
             Sign in with Google
           </button>
@@ -764,59 +775,59 @@ function App() {
 
   return (
     <>
-      <div className="min-h-screen bg-gray-50 flex flex-col">
-        {/* Header */}
-        <div className="bg-white shadow-sm">
-          <div className="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center">
-            <h1 className="text-xl font-bold text-gray-900">VoiceInbox</h1>
-            <div className="flex items-center gap-4">
+      <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-900 flex flex-col font-['Inter',system-ui,sans-serif] text-white">
+        {/* Minimal Header */}
+        <header className="bg-black/20 backdrop-blur-xl border-b border-white/10">
+          <div className="w-full max-w-sm mx-auto px-4 py-3 flex justify-between items-center">
+            <div className="flex items-center space-x-2">
+              <div className="w-6 h-6 bg-gradient-to-r from-blue-400 to-purple-500 rounded-lg flex items-center justify-center">
+                <svg className="w-3.5 h-3.5 text-white" fill="white" viewBox="0 0 24 24">
+                  <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                  <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </svg>
+              </div>
+              <h1 className="text-lg font-medium text-white">VoiceInbox</h1>
+            </div>
+            
+            <div className="flex items-center space-x-2">
+              <div className={`w-1.5 h-1.5 rounded-full ${
+                isConnecting 
+                  ? 'bg-yellow-400 animate-pulse'
+                  : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
+                    ? 'bg-green-400' 
+                    : 'bg-red-400'
+              }`}></div>
               <button
                 onClick={() => setShowTests(!showTests)}
-                className="text-sm text-gray-600 hover:text-gray-900"
+                className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
               >
-                {showTests ? 'Hide' : 'Show'} Tests
-              </button>
-              <button
-                onClick={testAudioOutput}
-                className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 border border-blue-300 rounded"
-              >
-                🔊 Test Audio
+                <svg className="w-4 h-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
               </button>
               {(!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) && !isConnecting && (
                 <button
                   onClick={forceReconnect}
-                  className="text-xs text-blue-600 hover:text-blue-800 px-2 py-1 border border-blue-300 rounded"
+                  className="text-xs text-blue-400 hover:text-blue-300 px-2 py-1 bg-blue-500/20 rounded-lg transition-colors"
                 >
                   Reconnect
                 </button>
               )}
-              {isConnecting && (
-                <span className="text-xs text-yellow-600 px-2 py-1">
-                  Connecting...
-                </span>
-              )}
               <button
                 onClick={handleLogout}
-                className="text-xs text-gray-500 hover:text-gray-700 px-2 py-1 border rounded"
+                className="text-xs text-gray-400 hover:text-gray-300 px-2 py-1 bg-white/5 rounded-lg transition-colors"
               >
                 Logout
               </button>
-              <div className={`w-2 h-2 rounded-full ${
-                isConnecting 
-                  ? 'bg-yellow-500 animate-pulse'
-                  : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
-                    ? 'bg-green-500' 
-                    : 'bg-red-500'
-              }`} />
-              <span className="text-sm text-gray-600">{userEmail}</span>
             </div>
           </div>
-        </div>
+        </header>
 
-        {/* Main content */}
-        <div className="flex-1 p-4">
+        {/* Main Interface */}
+        <main className="flex-1 flex flex-col w-full max-w-sm mx-auto px-6">
           {showTests ? (
-            <div className="max-w-4xl mx-auto space-y-6">
+            <div className="space-y-6 mt-8">
               <ConnectionTest />
               <GmailTest 
                 ws={wsRef.current} 
@@ -824,66 +835,13 @@ function App() {
               />
             </div>
           ) : (
-            <div className="flex items-center justify-center h-full">
-              <div className="text-center space-y-6">
-                {/* Voice Mode Selector */}
-                <div className="flex justify-center gap-2 mb-8">
-                  <button
-                    onClick={() => handleSwitchMode('manual')}
-                    className={`px-4 py-2 rounded-lg font-medium transition ${
-                      voiceMode === 'manual'
-                        ? 'bg-blue-500 text-white'
-                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                    }`}
-                  >
-                    🎤 Push to Talk
-                  </button>
-                  <button
-                    onClick={() => handleSwitchMode('hands-free')}
-                    className={`px-4 py-2 rounded-lg font-medium transition ${
-                      voiceMode === 'hands-free'
-                        ? 'bg-blue-500 text-white'
-                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                    }`}
-                  >
-                    🤲 Hands-Free
-                  </button>
-                </div>
-
-                {/* Status Display */}
-                <div className="mb-8">
-                  <p className="text-gray-600 mb-2">
-                    {isConnecting 
-                      ? 'Connecting to Gmail service...' 
-                      : isProcessingRequest
-                      ? '⚙️ Processing your request... Please wait'
-                      : isAISpeaking
-                      ? '🤖 AI is responding...'
-                      : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
-                        ? voiceMode === 'manual'
-                          ? isRecording
-                            ? '🎤 Recording... Release to send'
-                            : '🎤 Ready - Hold button to speak'
-                          : continuousVoiceCapture.isListening
-                            ? voiceStatus === 'active' || !useWakeWord
-                              ? '🎤 Listening for your command...'
-                              : '👂 Click "Activate Now" to start speaking'
-                            : '🔇 Voice capture inactive - click to start'
-                        : 'Connection lost - click Reconnect'
-                    }
-                  </p>
-                  {import.meta.env.DEV && (
-                    <span className="text-xs text-gray-400 block mt-1">
-                      Mode: {voiceMode} | WS: {wsRef.current ? wsRef.current.readyState : 'null'} | 
-                      {voiceMode === 'hands-free' && ` Status: ${voiceStatus} | Muted: ${continuousVoiceCapture.isMuted}`}
-                    </span>
-                  )}
-                </div>
-
-                {/* Voice Control */}
-                {voiceMode === 'manual' ? (
-                  // Manual Push-to-Talk Interface
-                  <div className="space-y-4">
+            <>
+              {/* Central Microphone Area */}
+              <div className="flex flex-col justify-center items-center py-8 min-h-[400px]">
+                
+                {/* Main Mic Button */}
+                <div className="relative mb-6">
+                  {voiceMode === 'manual' ? (
                     <button
                       onMouseDown={(e) => {
                         e.preventDefault()
@@ -908,163 +866,186 @@ function App() {
                         handleStopRecording()
                       }}
                       disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !manualVoiceCapture.isSupported || isAISpeaking || isProcessingRequest}
-                      className={
-                        `w-32 h-32 rounded-full transition-all duration-200 ` +
-                        (isRecording
-                          ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
+                      className={`w-28 h-28 rounded-full font-medium transition-all duration-300 shadow-2xl active:scale-95 relative overflow-hidden ${
+                        isRecording
+                          ? 'bg-gradient-to-r from-red-500 to-red-600 scale-110 shadow-red-500/50'
                           : isProcessingRequest
-                          ? 'bg-yellow-500 scale-105 shadow-lg animate-spin cursor-not-allowed' 
+                          ? 'bg-gradient-to-r from-amber-500 to-orange-500 shadow-amber-500/50'
                           : isAISpeaking
-                          ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
+                          ? 'bg-gradient-to-r from-purple-500 to-pink-500 shadow-purple-500/50'
                           : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && manualVoiceCapture.isSupported)
-                          ? 'bg-blue-500 hover:bg-blue-600 shadow'
-                          : 'bg-gray-300 cursor-not-allowed')
-                      }
+                          ? 'bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-400 hover:to-cyan-400 shadow-blue-500/50'
+                          : 'bg-gradient-to-r from-gray-600 to-gray-700 cursor-not-allowed shadow-gray-600/30'
+                      }`}
                     >
+                      {/* Pulse animation for recording */}
+                      {isRecording && (
+                        <div className="absolute inset-0 rounded-full bg-white/20 animate-ping"></div>
+                      )}
+                      
                       {isAISpeaking ? (
-                        <svg
-                          className="w-12 h-12 mx-auto text-white"
-                          fill="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                        <svg className="w-12 h-12 mx-auto relative z-10" fill="white" viewBox="0 0 24 24">
+                          <path d="M3 9v6h4l5 5V4L7 9H3z"/>
+                          <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
                         </svg>
                       ) : (
-                        <svg
-                          className="w-12 h-12 mx-auto text-white"
-                          fill="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                        <svg className="w-12 h-12 mx-auto relative z-10" fill="white" viewBox="0 0 24 24">
+                          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
                         </svg>
                       )}
                     </button>
-
-                    <p className="mt-4 text-xs text-gray-500">
-                      {!manualVoiceCapture.isSupported 
-                        ? 'Microphone not supported in this browser'
-                        : manualVoiceCapture.permissionStatus === 'denied'
-                        ? 'Microphone permission denied - please allow access'
-                        : isProcessingRequest
-                        ? '⚙️ Processing your request - please wait (prevents overlapping requests)'
-                        : isAISpeaking
-                        ? '🤖 AI is speaking - please wait'
-                        : isRecording 
-                        ? '🎤 Listening... Release to stop'
-                        : 'Hold to talk with VoiceInbox'
-                      }
-                    </p>
-                  </div>
-                ) : (
-                  // ChatGPT-Style Hands-Free Interface
-                  <div className="space-y-8">
-                    {/* Advanced Voice Visualizer */}
-                    <VoiceVisualizer 
-                      status={isAISpeaking ? 'speaking' : voiceStatus}
-                      isActive={continuousVoiceCapture.isActive}
-                      isMuted={continuousVoiceCapture.isMuted}
-                    />
-
-                    {/* Control buttons */}
-                    <div className="flex justify-center gap-4">
-                      {/* Main toggle button */}
-                      <button
-                        onClick={handleToggleHandsFree}
-                        disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !continuousVoiceCapture.isSupported}
-                        className={
-                          `px-6 py-3 rounded-xl font-medium transition-all duration-200 shadow-lg ` +
-                          (continuousVoiceCapture.isListening
-                            ? 'bg-red-500 text-white hover:bg-red-600'
-                            : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && continuousVoiceCapture.isSupported)
-                            ? 'bg-green-500 text-white hover:bg-green-600 hover:scale-105'
-                            : 'bg-gray-300 text-gray-500 cursor-not-allowed')
-                        }
-                      >
-                        {continuousVoiceCapture.isListening ? '🛑 Stop Listening' : '🎤 Start Voice Mode'}
-                      </button>
-
-                      {/* Secondary controls */}
+                  ) : (
+                    <button
+                      onClick={handleToggleHandsFree}
+                      disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !continuousVoiceCapture.isSupported}
+                      className={`w-28 h-28 rounded-full font-medium transition-all duration-300 shadow-2xl active:scale-95 relative overflow-hidden ${
+                        continuousVoiceCapture.isListening
+                          ? 'bg-gradient-to-r from-red-500 to-red-600 shadow-red-500/50'
+                          : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && continuousVoiceCapture.isSupported)
+                          ? 'bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-400 hover:to-cyan-400 shadow-blue-500/50'
+                          : 'bg-gradient-to-r from-gray-600 to-gray-700 cursor-not-allowed shadow-gray-600/30'
+                      }`}
+                    >
+                      {/* Voice visualizer for hands-free */}
                       {continuousVoiceCapture.isListening && (
-                        <>
-                          <button
-                            onClick={continuousVoiceCapture.toggleMute}
-                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 shadow ${
-                              continuousVoiceCapture.isMuted
-                                ? 'bg-red-500 text-white hover:bg-red-600'
-                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                            }`}
-                          >
-                            {continuousVoiceCapture.isMuted ? '🔇 Unmute' : '🔊 Mute'}
-                          </button>
-                          
-                          {useWakeWord && voiceStatus === 'listening' && (
-                            <button
-                              onClick={continuousVoiceCapture.activateManually}
-                              className="px-4 py-2 rounded-lg text-sm font-medium bg-green-500 text-white hover:bg-green-600 transition-all duration-200 shadow animate-pulse"
-                            >
-                              🎯 Activate Now
-                            </button>
-                          )}
-                        </>
+                        <div className="absolute inset-2 rounded-full border border-white/30 animate-pulse"></div>
                       )}
                       
-                      <button
-                        onClick={() => {
-                          setUseWakeWord(!useWakeWord)
-                          if (continuousVoiceCapture.isListening && !useWakeWord) {
-                            continuousVoiceCapture.stopListening()
-                            setTimeout(() => continuousVoiceCapture.startListening(), 100)
-                          }
-                        }}
-                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 shadow ${
-                          useWakeWord
-                            ? 'bg-yellow-500 text-white hover:bg-yellow-600'
-                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                        }`}
-                      >
-                        {useWakeWord ? '🎯 Manual Mode' : '🎤 Always Active'}
-                      </button>
-                    </div>
+                      {continuousVoiceCapture.isListening ? (
+                        <svg className="w-12 h-12 mx-auto relative z-10" fill="white" viewBox="0 0 24 24">
+                          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                          <circle cx="12" cy="12" r="8" fill="none" stroke="white" strokeWidth="1" opacity="0.5"/>
+                        </svg>
+                      ) : (
+                        <svg className="w-12 h-12 mx-auto relative z-10" fill="white" viewBox="0 0 24 24">
+                          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                        </svg>
+                      )}
+                    </button>
+                  )}
+                </div>
 
-                    {/* Help text */}
-                    <div className="text-center max-w-md mx-auto">
-                      <p className="text-sm text-gray-500 leading-relaxed">
-                        {!continuousVoiceCapture.isSupported 
-                          ? 'Microphone not supported in this browser'
-                          : continuousVoiceCapture.permissionStatus === 'denied'
-                          ? 'Microphone permission denied - please allow access'
-                          : isAISpeaking
-                          ? '🤖 I\'m responding to your question...'
-                          : continuousVoiceCapture.isListening
-                          ? useWakeWord
-                            ? voiceStatus === 'active'
-                              ? '🎤 I\'m listening! Speak naturally for up to 30 seconds.'
-                              : '💡 Say "hey voiceinbox" or click "Activate Now" to start speaking'
-                            : '🎤 Voice mode active - I\'m listening for your commands'
-                          : 'Click "Start Voice Mode" to begin hands-free interaction'
-                        }
-                      </p>
-                    </div>
-                  </div>
-                )}
+                {/* Status Text */}
+                <div className="text-center mb-4">
+                  <h2 className="text-xl font-medium text-white mb-1">
+                    {isConnecting 
+                      ? 'Connecting...' 
+                      : isProcessingRequest
+                      ? 'Processing...'
+                      : isAISpeaking
+                      ? 'Speaking...'
+                      : isRecording || (voiceMode === 'hands-free' && continuousVoiceCapture.isListening)
+                      ? 'Listening...'
+                      : 'Ready'
+                    }
+                  </h2>
+                  
+                  <p className="text-gray-400 text-sm">
+                    {isConnecting 
+                      ? 'Connecting to Gmail...'
+                      : isProcessingRequest
+                      ? 'Processing your request'
+                      : isAISpeaking
+                      ? 'Generating response'
+                      : voiceMode === 'manual'
+                        ? isRecording
+                          ? 'Release to send'
+                          : 'Hold to speak'
+                        : continuousVoiceCapture.isListening
+                          ? 'Say something'
+                          : 'Tap to activate'
+                    }
+                  </p>
+                </div>
 
-                {/* Visual Indicator for hands-free mode */}
-                {voiceMode === 'hands-free' && continuousVoiceCapture.isListening && (
-                  <div className="flex justify-center items-center gap-1 mt-4">
-                    <div className={`w-2 h-8 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '0ms' }}></div>
-                    <div className={`w-2 h-12 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '150ms' }}></div>
-                    <div className={`w-2 h-16 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '300ms' }}></div>
-                    <div className={`w-2 h-12 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '450ms' }}></div>
-                    <div className={`w-2 h-8 ${voiceStatus === 'active' || !useWakeWord ? 'bg-red-500' : 'bg-orange-400'} rounded-full animate-pulse`} style={{ animationDelay: '600ms' }}></div>
+                {/* Mode Toggle */}
+                <div className="bg-white/5 backdrop-blur-sm rounded-full p-1 border border-white/10">
+                  <div className="flex">
+                    <button
+                      onClick={() => handleSwitchMode('hands-free')}
+                      className={`px-4 py-2 rounded-full text-sm font-medium transition-all duration-200 ${
+                        voiceMode === 'hands-free'
+                          ? 'bg-white/20 text-white'
+                          : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      Hands-Free
+                    </button>
+                    <button
+                      onClick={() => handleSwitchMode('manual')}
+                      className={`px-4 py-2 rounded-full text-sm font-medium transition-all duration-200 ${
+                        voiceMode === 'manual'
+                          ? 'bg-white/20 text-white'
+                          : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      Push to Talk
+                    </button>
                   </div>
-                )}
+                </div>
               </div>
-            </div>
+
+              {/* Bottom Actions */}
+              <div className="pb-8 mt-8">
+                {/* Secondary Controls for Hands-Free */}
+                {voiceMode === 'hands-free' && continuousVoiceCapture.isListening && (
+                  <div className="flex justify-center space-x-3 mb-6">
+                    <button
+                      onClick={continuousVoiceCapture.toggleMute}
+                      className={`px-3 py-1.5 bg-white/10 backdrop-blur-sm rounded-full text-xs font-medium border border-white/20 hover:bg-white/20 transition-all ${
+                        continuousVoiceCapture.isMuted
+                          ? 'text-red-400'
+                          : 'text-gray-300'
+                      }`}
+                    >
+                      {continuousVoiceCapture.isMuted ? 'Unmute' : 'Mute'}
+                    </button>
+                    
+                    {useWakeWord && voiceStatus === 'listening' && (
+                      <button
+                        onClick={continuousVoiceCapture.activateManually}
+                        className="px-3 py-1.5 bg-green-500/20 text-green-400 rounded-full text-xs font-medium hover:bg-green-500/30 transition-all border border-green-500/30"
+                      >
+                        Activate
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Quick Suggestions */}
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-gray-500 text-center mb-3">
+                    Try saying
+                  </p>
+                  {['"How many unread emails?"', '"Show important emails"', '"Search invoices"'].map((suggestion, index) => (
+                    <button
+                      key={index}
+                      className="w-full p-2.5 bg-white/5 backdrop-blur-sm rounded-lg text-xs text-gray-300 hover:bg-white/10 hover:text-white transition-all border border-white/10"
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
           )}
-        </div>
+        </main>
       </div>
-      <Toaster position="top-right" />
+      <Toaster 
+        position="top-center" 
+        toastOptions={{
+          style: {
+            background: 'rgba(0, 0, 0, 0.8)',
+            color: 'white',
+            border: '1px solid rgba(255, 255, 255, 0.1)',
+            borderRadius: '12px',
+            backdropFilter: 'blur(10px)',
+          },
+        }}
+      />
     </>
   )
 }

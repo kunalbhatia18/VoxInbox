@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VoiceInbox Icon Generator</title>
+</head>
+<body>
+    <h1>VoiceInbox PWA Icon Generator</h1>
+    <p>This will generate basic icons. For production, use high-quality custom icons.</p>
+    <button onclick="generateIcons()">Generate Icons</button>
+    <div id="icons"></div>
+
+    <script>
+        function generateIcons() {
+            const sizes = [72, 96, 128, 144, 152, 192, 384, 512];
+            const iconsDiv = document.getElementById('icons');
+            
+            sizes.forEach(size => {
+                const canvas = document.createElement('canvas');
+                canvas.width = size;
+                canvas.height = size;
+                const ctx = canvas.getContext('2d');
+                
+                // Create gradient background
+                const gradient = ctx.createLinearGradient(0, 0, size, size);
+                gradient.addColorStop(0, '#3B82F6');
+                gradient.addColorStop(1, '#06B6D4');
+                
+                // Draw background
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, size, size);
+                
+                // Draw microphone icon
+                ctx.fillStyle = 'white';
+                const centerX = size / 2;
+                const centerY = size / 2;
+                const micSize = size * 0.4;
+                
+                // Microphone body
+                ctx.beginPath();
+                ctx.roundRect(centerX - micSize/4, centerY - micSize/2, micSize/2, micSize, micSize/8);
+                ctx.fill();
+                
+                // Microphone stand
+                ctx.fillRect(centerX - micSize/8, centerY + micSize/4, micSize/4, micSize/4);
+                ctx.fillRect(centerX - micSize/2, centerY + micSize/2 - micSize/16, micSize, micSize/8);
+                
+                // Convert to blob and create download link
+                canvas.toBlob(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `icon-${size}x${size}.png`;
+                    link.textContent = `Download ${size}x${size}`;
+                    link.style.display = 'block';
+                    link.style.margin = '5px';
+                    iconsDiv.appendChild(link);
+                });
+                
+                // Display canvas
+                canvas.style.margin = '10px';
+                canvas.style.border = '1px solid #ccc';
+                iconsDiv.appendChild(canvas);
+            });
+        }
+    </script>
+</body>
+</html>
