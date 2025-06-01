@@ -54,16 +54,9 @@ class OpenAIRealtimeProxy:
             "session": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are VoiceInbox, a Gmail assistant that helps users with their emails. "
-                    "IMPORTANT WORKFLOW: For any email-related question, you must: "
-                    "1) First call the appropriate function to get the data "
-                    "2) Then immediately give a natural spoken audio response based on that data "
-                    "For 'how many unread emails' -> call count_unread_emails, then speak the count "
-                    "For 'list emails' -> call list_unread, then speak about the emails "
-                    "For 'search emails' -> call search_messages, then speak about results "
-                    "CRITICAL: Always provide a complete spoken audio response after every function call. "
-                    "Never stop after just calling a function - always follow up with speech. "
-                    "Be conversational and helpful in your audio responses."
+                    "You are VoiceInbox, a helpful Gmail assistant. "
+                    "When users ask about their emails, call the appropriate function and then provide a natural, conversational response. "
+                    "Be concise but helpful in your audio responses."
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
@@ -73,9 +66,9 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.5,  # Lower threshold for faster detection
-                    "prefix_padding_ms": 100,  # Minimal padding for maximum speed
-                    "silence_duration_ms": 200  # Ultra-fast silence detection for <250ms
+                    "threshold": 0.6,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
                 },
                 "tools": tools,
                 "tool_choice": "auto",
@@ -232,19 +225,15 @@ class OpenAIRealtimeProxy:
                 if message_type in ["input_audio_buffer.commit", "response.create"]:
                     print(f"📤 Forwarded {message_type} to OpenAI")
                 
-                # CRITICAL FIX: Simplified response creation - inherit session settings
+                # For push-to-talk mode, manually create response after commit
                 if message_type == "input_audio_buffer.commit":
-                    # Create response automatically after commit - MUCH SIMPLER
+                    print("📱 Audio committed - creating response for push-to-talk mode")
+                    # Create response immediately since user manually stopped recording
                     response_message = {
                         "type": "response.create"
                     }
-                    # That's it! Let it inherit all settings from session including:
-                    # - modalities: ["text", "audio"]
-                    # - voice: "alloy"
-                    # - output_audio_format: "pcm16"
-                    # - tools and instructions from session
                     await self.openai_ws.send(json.dumps(response_message))
-                    print("🤖 Auto-created simplified response (inherits session settings)")
+                    print("🤖 Response created for push-to-talk interaction")
         
         # Legacy audio message handling (for backward compatibility)
         elif message_type == "audio":
@@ -294,6 +283,12 @@ class OpenAIRealtimeProxy:
         elif message_type == "response.created":
             # Reset audio chunk counter for new response
             self._audio_chunk_count = 0
+            
+            # Measure time from commit to response creation
+            if hasattr(self, '_commit_time'):
+                response_creation_time = time.time()
+                creation_latency = (response_creation_time - self._commit_time) * 1000
+                print(f"⚡ COMMIT TO RESPONSE: {creation_latency:.0f}ms (faster = better)")
             pass  # Logging handled in _listen_to_openai
         
         elif message_type == "conversation.item.created":
@@ -356,6 +351,8 @@ class OpenAIRealtimeProxy:
                 commit_time = time.time()
                 speech_duration = (commit_time - self._speech_start_time) * 1000
                 print(f"⏱️ User spoke for {speech_duration:.0f}ms before VAD cutoff")
+                # Start timing for response latency
+                self._commit_time = commit_time
         
         elif message_type == "response.audio.delta":
             # First audio chunk - measure total latency
@@ -507,15 +504,24 @@ class OpenAIRealtimeProxy:
                     # This is different from regular chat API - function calls don't automatically continue
                     if not self.pending_audio_response:
                         self.pending_audio_response = True
+                        
+                        # CRITICAL FIX: Use session defaults to avoid conflicts
                         audio_response = {
                             "type": "response.create"
+                            # Let it inherit session settings:
+                            # - temperature: 0.6 (meets minimum requirement)
+                            # - modalities: ["text", "audio"]
+                            # - max_response_output_tokens: 800
                         }
                         await self.openai_ws.send(json.dumps(audio_response))
-                        print(f"🎤 Created follow-up response for audio generation (Realtime API requirement)")
+                        print(f"🎤 Response created with session defaults (no conflicts)")
+                        
+                        # EMERGENCY TIMEOUT: Reset if no response within 10 seconds
+                        asyncio.create_task(self._emergency_timeout_reset(10.0))
                     else:
                         print(f"⏳ Audio response already pending, skipping duplicate")
-                    
-                    print(f"✅ Function {function_name} completed - OpenAI will now generate audio response")
+                
+                print(f"✅ Function {function_name} completed - OpenAI generating LIGHTNING-FAST response")
             else:
                 print(f"⚠️ Unknown function: {function_name}")
                 
@@ -523,6 +529,9 @@ class OpenAIRealtimeProxy:
             print(f"❌ Error executing function {function_name}: {e}")
             import traceback
             traceback.print_exc()
+            
+            # CRITICAL FIX: Always reset pending response on errors
+            self.pending_audio_response = False
             
             # Send error back to OpenAI
             if self.openai_ws:
@@ -602,6 +611,24 @@ class OpenAIRealtimeProxy:
                 print(f"❌ Error listening to OpenAI: {e}")
                 break
     
+    async def _emergency_timeout_reset(self, timeout_seconds: float):
+        """Emergency timeout to prevent stuck responses"""
+        await asyncio.sleep(timeout_seconds)
+        if self.pending_audio_response:
+            print(f"❗ EMERGENCY TIMEOUT: Resetting stuck response after {timeout_seconds}s")
+            self.pending_audio_response = False
+            
+            # Send emergency message to frontend
+            if self.client_ws:
+                try:
+                    await self.client_ws.send_json({
+                        "type": "error",
+                        "error": {"message": "Response timeout - please try again"},
+                        "emergency_reset": True
+                    })
+                except Exception as e:
+                    print(f"⚠️ Error sending emergency reset: {e}")
+
     async def cleanup(self):
         """Clean up connections"""
         if self.openai_ws:

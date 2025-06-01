@@ -26,6 +26,8 @@ function App() {
   const [isConnecting, setIsConnecting] = useState(false)
   const [authCheckInProgress, setAuthCheckInProgress] = useState(false)
   const [isAISpeaking, setIsAISpeaking] = useState(false)
+  const [isProcessingRequest, setIsProcessingRequest] = useState(false) // Prevent concurrent requests
+  const lastRequestTimeRef = useRef<number>(0) // Debounce requests
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('manual')
   const [useWakeWord, setUseWakeWord] = useState(false) // Default to false since wake word doesn't work on HTTP
   const [voiceStatus, setVoiceStatus] = useState<'idle' | 'listening' | 'processing' | 'active'>('idle')
@@ -34,6 +36,8 @@ function App() {
   const awaitingAudioRef = useRef(false)
   const responseTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const sessionReadyRef = useRef(false)
+  // Performance timing for latency measurement
+  const requestStartTimeRef = useRef<number>(0)
   // Issue 4 Fix: Connection state management
   const connectionStateRef = useRef<'idle' | 'connecting' | 'connected' | 'failed'>('idle')
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -43,13 +47,33 @@ function App() {
   // Manual voice capture hook (push-to-talk)
   const manualVoiceCapture = useVoiceCapture({
     onAudioData: (audioBase64: string) => {
-      if (!audioBase64 || audioBase64.length < 1000) {
+      // CRITICAL FIX: Prevent empty audio buffers completely
+      if (!audioBase64 || audioBase64.length < 2000) {  // Increased minimum size
         console.warn('⚠️ Audio buffer too small, skipping send:', audioBase64.length)
         toast.error('Please speak longer - audio too short')
         return
       }
       
+      // ADDITIONAL SAFETY: Prevent concurrent requests AND empty buffers
+      if (isProcessingRequest) {
+        console.warn('⚠️ Request already in progress, ignoring new audio')
+        toast.error('Still processing - please wait for response')
+        return
+      }
+      
+      // ADDITIONAL SAFETY: Debounce rapid requests (prevent <2s intervals)
+      const now = Date.now()
+      if (now - lastRequestTimeRef.current < 2000) {  // Increased to 2 seconds
+        console.warn('⚠️ Request too soon after previous, ignoring (debounce)')
+        toast.error('Please wait a moment between requests')
+        return
+      }
+      lastRequestTimeRef.current = now
+      
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        setIsProcessingRequest(true) // Block new requests immediately
+        toast('🔄 Processing your voice command...', { icon: '⚙️', duration: 2000 })
+        
         const audioMessage = {
           type: "input_audio_buffer.append",
           audio: audioBase64
@@ -62,6 +86,10 @@ function App() {
         }
         wsRef.current.send(JSON.stringify(commitMessage))
         console.log('📱 Committed audio buffer to OpenAI')
+        
+        // Start performance timing for latency measurement
+        requestStartTimeRef.current = performance.now()
+        console.log('⏱️ Started latency timer - blocking new requests until complete')
         
         // CRITICAL FIX: Don't create response from frontend - let backend handle it
         // The backend will automatically create response after receiving committed audio
@@ -125,6 +153,11 @@ function App() {
     onPlaybackEnd: () => {
       console.log('🔊 AI finished speaking')
       setIsAISpeaking(false)
+      
+      // CRITICAL FIX: Reset processing state when audio ends (full cycle complete)
+      setIsProcessingRequest(false)
+      console.log('✓ Full response cycle complete - ready for new requests')
+      
       // Simple toast without dismissing all
       toast.success('Response complete', { icon: '✓', duration: 1500 })
     },
@@ -335,14 +368,20 @@ function App() {
             if (responseTimeoutRef.current) {
               clearTimeout(responseTimeoutRef.current)
             }
+            // REDUCED TIMEOUT: Faster recovery from stuck states
             responseTimeoutRef.current = setTimeout(() => {
               if (awaitingAudioRef.current && !isAISpeaking) {
-                console.log('⚠️ No audio received from OpenAI within 5 seconds')
-                // Check if OpenAI response was completed without audio
-                toast('OpenAI gave text-only response. Try asking a simpler question.', { icon: '💬', duration: 4000 })
+                console.log('⚠️ No audio received from OpenAI within 3 seconds - resetting state')
                 awaitingAudioRef.current = false
+                requestStartTimeRef.current = 0 // Reset timing
+                
+                // CRITICAL FIX: Reset processing state on timeout
+                setIsProcessingRequest(false)
+                console.log('⏰ Timeout occurred - reset processing state for retry')
+                
+                toast('Request timed out. You can try speaking again.', { icon: '⏰', duration: 3000 })
               }
-            }, 5000) // 5 second timeout for audio
+            }, 3000) // 3 second timeout for faster recovery
             
           } else if (messageType === 'response.audio.delta') {
             if (message.delta) {
@@ -351,6 +390,18 @@ function App() {
                 if (responseTimeoutRef.current) {
                   clearTimeout(responseTimeoutRef.current)
                   responseTimeoutRef.current = null
+                }
+                
+                // Measure total latency from request to first audio
+                if (requestStartTimeRef.current > 0) {
+                  const totalLatency = performance.now() - requestStartTimeRef.current
+                  console.log(`⚡ TOTAL RESPONSE LATENCY: ${Math.round(totalLatency)}ms (target: <250ms)`)
+                  if (totalLatency > 250) {
+                    console.warn(`⚠️ Latency above target! ${Math.round(totalLatency)}ms > 250ms`)
+                  } else {
+                    console.log(`✅ Excellent latency! ${Math.round(totalLatency)}ms < 250ms`)
+                  }
+                  requestStartTimeRef.current = 0 // Reset timer
                 }
               }
               audioPlaybackHook.addAudioChunk(message.delta)
@@ -373,6 +424,10 @@ function App() {
             }
             awaitingAudioRef.current = false
             
+            // CRITICAL FIX: Reset processing state to allow new requests
+            setIsProcessingRequest(false)
+            console.log('✅ Request processing complete - ready for new requests')
+            
             // Log the full response for debugging
             if (message.response && import.meta.env.DEV) {
               console.log('Full response:', message.response)
@@ -384,6 +439,23 @@ function App() {
           } else if (messageType === 'error' && !message.function) {
             console.error('❌ OpenAI Error:', message.error)
             toast.error(`OpenAI Error: ${message.error?.message || 'Unknown error'}`)
+            
+            // CRITICAL FIX: Reset processing state on errors
+            setIsProcessingRequest(false)
+            console.log('❌ Error occurred - reset processing state for retry')
+            
+            // EMERGENCY RESET: Handle timeout errors
+            if (message.emergency_reset) {
+              console.log('❗ Emergency timeout reset - clearing all states')
+              setIsAISpeaking(false)
+              awaitingAudioRef.current = false
+              if (responseTimeoutRef.current) {
+                clearTimeout(responseTimeoutRef.current)
+                responseTimeoutRef.current = null
+              }
+              requestStartTimeRef.current = 0
+              toast.error('Response timed out. Please try again.', { duration: 4000 })
+            }
           }
           
           if (messageType === 'function_result') {
@@ -554,9 +626,16 @@ function App() {
       }
     }
     
+    // CRITICAL FIX: Block recording when AI is speaking OR when processing request
     if (isAISpeaking) {
       console.log('AI is speaking, cannot start recording')
       toast('Please wait for AI to finish speaking', { icon: '⏳', duration: 2000 })
+      return
+    }
+    
+    if (isProcessingRequest) {
+      console.log('Still processing previous request, please wait')
+      toast('Still processing - please wait for response', { icon: '⚙️', duration: 2000 })
       return
     }
     
@@ -776,6 +855,8 @@ function App() {
                   <p className="text-gray-600 mb-2">
                     {isConnecting 
                       ? 'Connecting to Gmail service...' 
+                      : isProcessingRequest
+                      ? '⚙️ Processing your request... Please wait'
                       : isAISpeaking
                       ? '🤖 AI is responding...'
                       : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) 
@@ -826,11 +907,13 @@ function App() {
                         e.preventDefault()
                         handleStopRecording()
                       }}
-                      disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !manualVoiceCapture.isSupported || isAISpeaking}
+                      disabled={!wsConnected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN || !manualVoiceCapture.isSupported || isAISpeaking || isProcessingRequest}
                       className={
                         `w-32 h-32 rounded-full transition-all duration-200 ` +
                         (isRecording
                           ? 'bg-red-500 scale-110 shadow-lg animate-pulse'
+                          : isProcessingRequest
+                          ? 'bg-yellow-500 scale-105 shadow-lg animate-spin cursor-not-allowed' 
                           : isAISpeaking
                           ? 'bg-purple-500 scale-105 shadow-lg animate-pulse cursor-not-allowed'
                           : (wsConnected && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && manualVoiceCapture.isSupported)
@@ -863,6 +946,8 @@ function App() {
                         ? 'Microphone not supported in this browser'
                         : manualVoiceCapture.permissionStatus === 'denied'
                         ? 'Microphone permission denied - please allow access'
+                        : isProcessingRequest
+                        ? '⚙️ Processing your request - please wait (prevents overlapping requests)'
                         : isAISpeaking
                         ? '🤖 AI is speaking - please wait'
                         : isRecording 

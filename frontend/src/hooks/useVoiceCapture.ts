@@ -107,7 +107,7 @@ export const useVoiceCapture = ({
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
-          sampleRate: 48000,  // FIXED: Match everything else at 48kHz
+          sampleRate: 24000,  // FIXED: Match OpenAI's 24kHz exactly - no resampling needed!
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
@@ -184,7 +184,7 @@ export const useVoiceCapture = ({
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: 48000,  // FIXED: Match AudioContext sample rate
+            sampleRate: 24000,  // FIXED: Match OpenAI directly
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
@@ -218,9 +218,9 @@ export const useVoiceCapture = ({
         workletLoadedRef.current = false // Reset worklet loaded state
       }
       
-      // CRITICAL FIX: Force 48kHz AudioContext for voice capture
+      // CRITICAL FIX: Force 24kHz AudioContext to match OpenAI exactly
       audioContextRef.current = new AudioContextClass({
-        sampleRate: 48000,  // Force 48kHz to match audio playback
+        sampleRate: 24000,  // Match OpenAI's 24kHz - no resampling needed!
         latencyHint: 'interactive'
       })
       audioContextInstanceRef.current++
@@ -321,7 +321,7 @@ export const useVoiceCapture = ({
       
       // Process audio
       if (audioBufferRef.current.length > 0) {
-        const sampleRate = audioContextRef.current?.sampleRate || 48000
+        const sampleRate = audioContextRef.current?.sampleRate || 24000
         
         // Combine all buffers
         const totalLength = audioBufferRef.current.reduce((acc, buf) => acc + buf.length, 0)

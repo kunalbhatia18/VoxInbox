@@ -197,7 +197,7 @@ export const useContinuousVoiceCapture = ({
     if (combined.length < 1000) return
     
     // Resample to 24kHz if needed
-    const sampleRate = audioContextRef.current?.sampleRate || 48000
+    const sampleRate = audioContextRef.current?.sampleRate || 24000
     const resampled = sampleRate === 24000 ? combined : resampleAudio(combined, sampleRate, 24000)
     
     // Convert to PCM16 and base64
@@ -275,7 +275,7 @@ export const useContinuousVoiceCapture = ({
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: 48000,  // FIXED: Consistent 48kHz sample rate
+            sampleRate: 24000,  // FIXED: Match OpenAI's 24kHz directly
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
@@ -309,9 +309,9 @@ export const useContinuousVoiceCapture = ({
         workletLoadedRef.current = false // Reset worklet loaded state
       }
       
-      // CRITICAL FIX: Force 48kHz AudioContext for voice capture
+      // CRITICAL FIX: Force 24kHz AudioContext to match OpenAI exactly
       audioContextRef.current = new AudioContextClass({
-        sampleRate: 48000  // Force 48kHz to match audio playback
+        sampleRate: 24000  // Match OpenAI's 24kHz - no resampling needed!
       })
       
       // Resume context if needed
