@@ -1,0 +1,10 @@
+{
+  "name": "VoiceInbox",
+  "short_name": "VoiceInbox",
+  "description": "Process your inbox with just your voice",
+  "theme_color": "#3B82F6",
+  "background_color": "#000000",
+  "display": "standalone",
+  "start_url": "/",
+  "icons": []
+}
