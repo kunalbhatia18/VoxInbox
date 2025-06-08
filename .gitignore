@@ -40,3 +40,5 @@ workbox-*.js
 # Test artifacts
 coverage/
 .pytest_cache/
+.vercel
+.env.local

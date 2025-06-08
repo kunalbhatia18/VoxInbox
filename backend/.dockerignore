@@ -1,0 +1,42 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.pytest_cache
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local files
+.env.local
+.env.development
+
+# Cache and temp files
+.cache/
+*.tmp
+*.temp
+
+# Backup files
+*.backup
+main.py.complex
+requirements.txt.complex
+main.py.backup
+requirements.txt.backup

@@ -5,7 +5,7 @@ import asyncio
 import aiosqlite
 import base64
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from email.mime.text import MIMEText
@@ -34,8 +34,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+# 🚀 NEW: Separate CORS origin from OAuth redirect URL
+CORS_ORIGIN = os.getenv("CORS_ORIGIN")  # Optional - will auto-extract from FRONTEND_URL if not set
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
-REDIRECT_URI = "http://localhost:8000/oauth2callback"
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/oauth2callback")
 
 # Validate required environment variables
 if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, OPENAI_API_KEY]):
@@ -81,16 +83,40 @@ RATE_LIMIT_OPENAI_CALLS_PER_MINUTE = 30  # OpenAI API calls per user
 RATE_LIMIT_GMAIL_CALLS_PER_MINUTE = 100  # Gmail API calls per user
 RATE_LIMIT_WINDOW_SIZE = 60  # Rate limit window in seconds
 
+# NEW: Daily rate limits for YC demo protection (voice interactions)
+RATE_LIMIT_VOICE_SESSIONS_PER_DAY = 100  # Voice sessions per user per day (main cost protection)
+RATE_LIMIT_REQUESTS_PER_DAY = 200  # General requests per user per day
+
 # Initialize FastAPI
 app = FastAPI(title="VoiceInbox MVP API")
 
-# Configure CORS
+# Configure CORS - allow both production and localhost for development
+# 🚀 FIXED: Separate CORS origin from OAuth redirect URL
+if CORS_ORIGIN:
+    # Use explicit CORS_ORIGIN if provided
+    cors_origin = CORS_ORIGIN
+else:
+    # Auto-extract origin from FRONTEND_URL (domain only, no path)
+    from urllib.parse import urlparse
+    parsed = urlparse(FRONTEND_URL)
+    cors_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+allowed_origins = [cors_origin]
+if cors_origin != "http://localhost:5173":
+    allowed_origins.append("http://localhost:5173")  # Allow localhost for development
+
+print(f"🚀 CORS Configuration:")
+print(f"   Frontend URL (OAuth): {FRONTEND_URL}")
+print(f"   CORS Origin (Browser): {cors_origin}")
+print(f"   Allowed Origins: {allowed_origins}")
+    
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=True,  # Still keep this for other potential cookies
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # In-memory storage
@@ -98,11 +124,17 @@ sessions: Dict[str, Dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
 active_proxies: Dict[str, OpenAIRealtimeProxy] = {}  # Store proxy instances per user
 
-# Issue 9 Fix: Rate limiting storage
-rate_limit_data: Dict[str, Dict[str, deque]] = defaultdict(lambda: {
+# Issue 9 Fix: Rate limiting storage (with daily voice session limits)
+rate_limit_data: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
     'requests': deque(),
     'openai_calls': deque(),
-    'gmail_calls': deque()
+    'gmail_calls': deque(),
+    'daily_counts': {
+        'requests': 0,
+        'voice_sessions': 0,  # Track voice sessions (main cost)
+        'gmail_calls': 0,
+        'date': datetime.now().date()
+    }
 })
 
 # Issue 6 Fix: Memory management tracking
@@ -111,6 +143,8 @@ memory_usage_tracker = {
     'cache_items': 0,
     'last_cleanup': time.time()
 }
+
+
 
 # Pydantic models for Gmail helpers
 class SearchMessagesArgs(BaseModel):
@@ -177,23 +211,42 @@ class CreateCalendarEventArgs(BaseModel):
     end_epoch_ms: int
     attendees: List[str] = Field(default=[])
 
-# Issue 9 Fix: Rate limiting functions
-def check_rate_limit(user_id: str, limit_type: str, limit_per_minute: int) -> bool:
-    """Check if user has exceeded rate limit for given type"""
+# Issue 9 Fix: Rate limiting functions (with daily limits)
+def check_rate_limit(user_id: str, limit_type: str, limit_per_minute: int, limit_per_day: int = None) -> bool:
+    """Check if user has exceeded rate limit for given type (both minute and daily)"""
     now = time.time()
+    today = datetime.now().date()
     user_limits = rate_limit_data[user_id]
+    
+    # Reset daily counters if date changed
+    if user_limits['daily_counts']['date'] != today:
+        user_limits['daily_counts'] = {
+            'requests': 0,
+            'voice_sessions': 0,
+            'gmail_calls': 0,
+            'date': today
+        }
+        print(f"🗓️ Daily limits reset for user {user_id}")
+    
+    # Check daily limit first (if specified)
+    if limit_per_day and user_limits['daily_counts'][limit_type] >= limit_per_day:
+        print(f"🚫 Daily limit exceeded for {user_id}: {user_limits['daily_counts'][limit_type]}/{limit_per_day} {limit_type}")
+        return False
     
     # Clean old entries (older than rate limit window)
     limit_deque = user_limits[limit_type]
     while limit_deque and limit_deque[0] < now - RATE_LIMIT_WINDOW_SIZE:
         limit_deque.popleft()
     
-    # Check if limit exceeded
+    # Check per-minute limit
     if len(limit_deque) >= limit_per_minute:
+        print(f"🚫 Per-minute limit exceeded for {user_id}: {len(limit_deque)}/{limit_per_minute} {limit_type}")
         return False
     
-    # Add current request
+    # Add current request to both minute and daily counters
     limit_deque.append(now)
+    user_limits['daily_counts'][limit_type] += 1
+    
     return True
 
 def cleanup_rate_limit_data() -> None:
@@ -214,6 +267,35 @@ def cleanup_rate_limit_data() -> None:
         # Remove user if no recent activity
         if all(len(deque_data) == 0 for deque_data in user_data.values()):
             del rate_limit_data[user_id]
+
+def check_voice_session_limit(user_id: str) -> Tuple[bool, str]:
+    """Check if user can start a new voice session. Returns (can_proceed, error_message)"""
+    user_data = rate_limit_data[user_id]
+    today = datetime.now().date()
+    
+    # Reset daily counters if date changed
+    if user_data['daily_counts']['date'] != today:
+        user_data['daily_counts'] = {
+            'requests': 0,
+            'voice_sessions': 0,
+            'gmail_calls': 0,
+            'date': today
+        }
+        print(f"🗓️ Daily limits reset for user {user_id}")
+    
+    # Check voice session daily limit
+    if user_data['daily_counts']['voice_sessions'] >= RATE_LIMIT_VOICE_SESSIONS_PER_DAY:
+        current_count = user_data['daily_counts']['voice_sessions']
+        error_msg = f"Daily voice limit exceeded ({current_count}/{RATE_LIMIT_VOICE_SESSIONS_PER_DAY}). Try again tomorrow."
+        return False, error_msg
+    
+    return True, ""
+
+def increment_voice_session(user_id: str) -> int:
+    """Increment voice session counter and return current count"""
+    user_data = rate_limit_data[user_id]
+    user_data['daily_counts']['voice_sessions'] += 1
+    return user_data['daily_counts']['voice_sessions']
 
 # Issue 6 Fix: Memory management functions
 def truncate_large_result(result: Any, max_size: int = MAX_FUNCTION_RESULT_SIZE) -> str:
@@ -325,8 +407,15 @@ async def cache_set(user_id: str, key: str, data: Dict):
 
 # Helper function to get current user with rate limiting
 def get_current_user(request: Request) -> str:
-    """Get current user from session cookie with rate limiting"""
-    session_id = request.cookies.get("session_id")
+    """Get current user from session cookie or Authorization header"""
+    # Try Authorization header first
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        session_id = auth_header.split(" ")[1]
+    else:
+        # Fallback to cookie for backward compatibility
+        session_id = request.cookies.get("session_id")
+    
     if not session_id or session_id not in sessions:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -337,9 +426,15 @@ def get_current_user(request: Request) -> str:
     
     user_id = session["user_id"]
     
-    # Issue 9 Fix: Rate limiting for general requests
-    if not check_rate_limit(user_id, 'requests', RATE_LIMIT_REQUESTS_PER_MINUTE):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait a moment.")
+    # Issue 9 Fix: Rate limiting for general requests (with daily limit)
+    if not check_rate_limit(user_id, 'requests', RATE_LIMIT_REQUESTS_PER_MINUTE, RATE_LIMIT_REQUESTS_PER_DAY):
+        # Check which limit was exceeded for better error message
+        user_data = rate_limit_data[user_id]
+        daily_count = user_data['daily_counts']['requests']
+        if daily_count >= RATE_LIMIT_REQUESTS_PER_DAY:
+            raise HTTPException(status_code=429, detail=f"Daily limit exceeded ({daily_count}/{RATE_LIMIT_REQUESTS_PER_DAY}). Try again tomorrow.")
+        else:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait a moment.")
     
     return user_id
 
@@ -370,7 +465,7 @@ def get_gmail_service(user_id: str):
 # Gmail helper functions with rate limiting and memory management
 async def search_messages(user_id: str, args: SearchMessagesArgs) -> Dict:
     """Search Gmail messages with rate limiting and memory management"""
-    # Issue 9 Fix: Rate limiting check
+    # Issue 9 Fix: Rate limiting check (Gmail calls)
     if not check_rate_limit(user_id, 'gmail_calls', RATE_LIMIT_GMAIL_CALLS_PER_MINUTE):
         raise ValueError("RATE_LIMIT: Too many Gmail API calls. Please wait a moment.")
     
@@ -500,11 +595,7 @@ async def get_thread(user_id: str, args: GetThreadArgs) -> Dict:
         raise ValueError(f"THREAD_ERROR: {str(e)}")
 
 async def summarize_messages(user_id: str, args: SummarizeMessagesArgs) -> Dict:
-    """Summarize multiple messages using GPT with rate limiting"""
-    # Issue 9 Fix: Rate limiting for OpenAI calls
-    if not check_rate_limit(user_id, 'openai_calls', RATE_LIMIT_OPENAI_CALLS_PER_MINUTE):
-        raise ValueError("RATE_LIMIT: Too many OpenAI API calls. Please wait a moment.")
-    
+    """Summarize multiple messages using GPT"""
     # First fetch the messages
     messages_data = []
     service = get_gmail_service(user_id)
@@ -555,11 +646,7 @@ async def summarize_messages(user_id: str, args: SummarizeMessagesArgs) -> Dict:
         return {'summary': f'Error creating summary: {str(e)}', 'message_count': len(messages_data)}
 
 async def summarize_thread(user_id: str, args: SummarizeThreadArgs) -> Dict:
-    """Summarize an email thread with rate limiting"""
-    # Issue 9 Fix: Rate limiting for OpenAI calls
-    if not check_rate_limit(user_id, 'openai_calls', RATE_LIMIT_OPENAI_CALLS_PER_MINUTE):
-        raise ValueError("RATE_LIMIT: Too many OpenAI API calls. Please wait a moment.")
-    
+    """Summarize an email thread"""
     thread = await get_thread(user_id, GetThreadArgs(thread_id=args.thread_id, include_body=True))
     
     prompt = "Summarize this email thread:\n\n"
@@ -876,6 +963,16 @@ GMAIL_FUNCTIONS = {name: func for name, (func, _) in GMAIL_FUNCTIONS_WITH_ARGS.i
 async def root():
     return {"message": "VoiceInbox MVP API", "functions": list(GMAIL_FUNCTIONS.keys())}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for load balancers and monitoring"""
+    return {
+        "status": "healthy",
+        "service": "VoiceInbox Backend",
+        "timestamp": datetime.now().isoformat(),
+        "functions_available": len(GMAIL_FUNCTIONS)
+    }
+
 @app.get("/debug/session")
 async def debug_session(request: Request):
     """Debug endpoint to check session status"""
@@ -901,7 +998,13 @@ async def auth_status(request: Request):
 @app.post("/auth/logout")
 async def logout(request: Request):
     """Logout user and clear session"""
-    session_id = request.cookies.get("session_id")
+    # Try to get session from both token and cookie
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        session_id = auth_header.split(" ")[1]
+    else:
+        session_id = request.cookies.get("session_id")
+    
     if session_id and session_id in sessions:
         # Remove from active websockets
         user_id = sessions[session_id].get("user_id")
@@ -910,9 +1013,21 @@ async def logout(request: Request):
         # Remove session
         del sessions[session_id]
     
-    # Clear cookie
+    # Clear cookie with same settings
     response = JSONResponse({"success": True, "message": "Logged out successfully"})
-    response.delete_cookie(key="session_id")
+    is_https = FRONTEND_URL.startswith('https://')
+    
+    # 🚀 FIXED: Clear cookie with same domain as set
+    from urllib.parse import urlparse
+    frontend_parsed = urlparse(FRONTEND_URL)
+    cookie_domain = frontend_parsed.netloc  # kunalis.me
+    
+    response.delete_cookie(
+        key="session_id",
+        domain=cookie_domain,  # 🚀 NEW: Same domain as set
+        samesite="none" if is_https else "lax",
+        secure=is_https
+    )
     return response
 
 @app.get("/login")
@@ -946,7 +1061,18 @@ async def login():
     }
     
     response = RedirectResponse(url=authorization_url)
-    response.set_cookie(key="session_id", value=session_id, samesite="lax")
+    # Use same cookie settings as OAuth callback
+    is_https = FRONTEND_URL.startswith('https://')
+    
+    # 🚀 FIXED: Set cookie for BACKEND domain during OAuth flow
+    # (Frontend domain cookie will be set in oauth2callback after success)
+    response.set_cookie(
+        key="session_id", 
+        value=session_id, 
+        # No domain = defaults to current domain (backend)
+        samesite="none" if is_https else "lax",
+        secure=is_https
+    )
     return response
 
 @app.get("/oauth2callback")
@@ -984,8 +1110,11 @@ async def oauth2callback(request: Request, code: str, state: str):
     user_info = service.userinfo().get().execute()
     user_id = user_info["id"]
     
+    # Create new session ID for the authenticated session
+    new_session_id = secrets.token_urlsafe(32)
+    
     # Store session
-    sessions[session_id] = {
+    sessions[new_session_id] = {
         "user_id": user_id,
         "email": user_info["email"],
         "access_token": credentials.token,
@@ -993,10 +1122,8 @@ async def oauth2callback(request: Request, code: str, state: str):
         "expires_at": (datetime.now() + timedelta(hours=1)).timestamp()
     }
     
-    # Redirect to frontend
-    response = RedirectResponse(url=FRONTEND_URL)
-    response.set_cookie(key="session_id", value=session_id, httponly=False, samesite="lax", secure=False)
-    return response
+    # Redirect to frontend with token in URL fragment
+    return RedirectResponse(url=f"{FRONTEND_URL}#token={new_session_id}")
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -1011,6 +1138,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         return
     
     user_id = sessions[session_id]["user_id"]
+    
+    # 🛡️ CRITICAL: Check daily voice session limit (main cost protection)
+    can_proceed, error_message = check_voice_session_limit(user_id)
+    if not can_proceed:
+        await websocket.send_json({
+            "type": "error",
+            "error": {
+                "message": error_message,
+                "code": "DAILY_VOICE_LIMIT_EXCEEDED"
+            }
+        })
+        await websocket.close(code=4003, reason="Daily voice limit exceeded")
+        return
+    
+    # Increment voice session counter
+    current_count = increment_voice_session(user_id)
+    print(f"🎙️ Voice session {current_count}/{RATE_LIMIT_VOICE_SESSIONS_PER_DAY} for user {user_id}")
     
     # Close existing connections for this user
     if user_id in active_websockets:
@@ -1180,9 +1324,13 @@ async def startup_event():
     print(f"✅ {len(GMAIL_FUNCTIONS)} Gmail functions available")
     print("🎙️ OpenAI Realtime API integration ready")
     print("🔄 Backward compatibility maintained for existing functions")
-    print(f"🛡️ Rate limiting enabled: {RATE_LIMIT_REQUESTS_PER_MINUTE} req/min, {RATE_LIMIT_GMAIL_CALLS_PER_MINUTE} Gmail/min, {RATE_LIMIT_OPENAI_CALLS_PER_MINUTE} OpenAI/min")
+    print(f"🛡️ Rate limiting enabled:")
+    print(f"   Per minute: {RATE_LIMIT_REQUESTS_PER_MINUTE} req/min, {RATE_LIMIT_GMAIL_CALLS_PER_MINUTE} Gmail/min, {RATE_LIMIT_OPENAI_CALLS_PER_MINUTE} OpenAI/min")
+    print(f"   Per day: {RATE_LIMIT_REQUESTS_PER_DAY} req/day, {RATE_LIMIT_VOICE_SESSIONS_PER_DAY} voice sessions/day 💰")
     print(f"🧹 Memory management enabled: {MAX_FUNCTION_RESULT_SIZE}B result limit, {MAX_EMAIL_BODY_SIZE}B email limit")
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

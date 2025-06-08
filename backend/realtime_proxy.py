@@ -66,9 +66,9 @@ class OpenAIRealtimeProxy:
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.6,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 300
                 },
                 "tools": tools,
                 "tool_choice": "auto",
@@ -83,7 +83,7 @@ class OpenAIRealtimeProxy:
             print(f"🔧 Configured {len(tools)} Gmail functions for OpenAI")
             print(f"🎯 Tools available: {[tool['name'] for tool in tools]}")
             print(f"💬 Instructions: {session_config['session']['instructions'][:100]}...")
-            print(f"🔧 Tool choice: {session_config['session']['tool_choice']}")
+            print(f"🎯 VAD optimized: 300ms silence detection, 200ms padding for FASTER response")
     
     def _create_gmail_tools(self):
         """Convert Gmail functions to OpenAI tool format"""
@@ -359,11 +359,11 @@ class OpenAIRealtimeProxy:
             if hasattr(self, '_speech_start_time') and not hasattr(self, '_first_audio_time'):
                 self._first_audio_time = time.time()
                 total_latency = (self._first_audio_time - self._speech_start_time) * 1000
-                print(f"⚡ TOTAL LATENCY: {total_latency:.0f}ms (target: <250ms)")
-                if total_latency > 250:
-                    print(f"⚠️ Latency above target! Consider optimizing VAD settings.")
+                print(f"⚡ TOTAL LATENCY: {total_latency:.0f}ms (target: <200ms - improved from 500ms VAD)")
+                if total_latency > 200:
+                    print(f"⚠️ Latency above new target! {total_latency:.0f}ms > 200ms")
                 else:
-                    print(f"✅ Latency within target!")
+                    print(f"✅ Excellent latency! {total_latency:.0f}ms < 200ms")
         
         elif message_type == "conversation.item.input_audio_transcription.completed":
             transcription = message_data.get('transcript', '')
@@ -432,19 +432,39 @@ class OpenAIRealtimeProxy:
                 
                 # Functions with simple parameters (like max_results)
                 elif function_name in ['categorize_unread']:
-                    from main import CategorizeUnreadArgs
-                    max_results = args.get('max_results', 20)
-                    result = await func(self.user_id, CategorizeUnreadArgs(max_results=max_results))
+                    try:
+                        import importlib
+                        main_module = importlib.import_module('main')
+                        CategorizeUnreadArgs = getattr(main_module, 'CategorizeUnreadArgs')
+                        max_results = args.get('max_results', 20)
+                        result = await func(self.user_id, CategorizeUnreadArgs(max_results=max_results))
+                    except (ImportError, AttributeError) as e:
+                        print(f"Warning: Could not import CategorizeUnreadArgs: {e}")
+                        # Fallback: call with max_results directly
+                        max_results = args.get('max_results', 20)
+                        result = await func(self.user_id, max_results)
                 
                 # Functions with complex args that need the full args dict
                 else:
-                    # Import here to avoid circular imports
-                    from main import (
-                        SearchMessagesArgs, GetThreadArgs, SummarizeMessagesArgs,
-                        SummarizeThreadArgs, CategorizeUnreadArgs, CreateDraftArgs,
-                        SendDraftArgs, ScheduleSendArgs, ModifyLabelsArgs,
-                        BulkDeleteArgs, MarkReadArgs, CreateCalendarEventArgs
-                    )
+                    # Import here to avoid circular imports - use dynamic import
+                    try:
+                        import importlib
+                        main_module = importlib.import_module('main')
+                        SearchMessagesArgs = getattr(main_module, 'SearchMessagesArgs')
+                        GetThreadArgs = getattr(main_module, 'GetThreadArgs')
+                        SummarizeMessagesArgs = getattr(main_module, 'SummarizeMessagesArgs')
+                        SummarizeThreadArgs = getattr(main_module, 'SummarizeThreadArgs')
+                        CategorizeUnreadArgs = getattr(main_module, 'CategorizeUnreadArgs')
+                        CreateDraftArgs = getattr(main_module, 'CreateDraftArgs')
+                        SendDraftArgs = getattr(main_module, 'SendDraftArgs')
+                        ScheduleSendArgs = getattr(main_module, 'ScheduleSendArgs')
+                        ModifyLabelsArgs = getattr(main_module, 'ModifyLabelsArgs')
+                        BulkDeleteArgs = getattr(main_module, 'BulkDeleteArgs')
+                        MarkReadArgs = getattr(main_module, 'MarkReadArgs')
+                        CreateCalendarEventArgs = getattr(main_module, 'CreateCalendarEventArgs')
+                    except ImportError as e:
+                        print(f"Warning: Could not import from main module: {e}")
+                        raise
                     
                     # Map function names to their argument classes
                     arg_classes = {
@@ -471,20 +491,20 @@ class OpenAIRealtimeProxy:
                 
                 # Issue 6 Fix: Use consistent truncation function
                 try:
-                    from main import truncate_large_result
+                    import importlib
+                    main_module = importlib.import_module('main')
+                    truncate_large_result = getattr(main_module, 'truncate_large_result')
                     result_str = truncate_large_result(result, 4000)  # 4KB limit for audio responses
                     
                     original_size = len(json.dumps(result, default=str))
                     if len(result_str) < original_size:
                         print(f"⚠️ Truncated large result for {function_name}: {original_size} -> {len(result_str)} chars")
-                except ImportError:
+                except (ImportError, AttributeError):
                     # Fallback to original logic if import fails
                     result_str = json.dumps(result, default=str)
                     if len(result_str) > 4000:
                         result_str = result_str[:4000] + '... (truncated)'
                         print(f"⚠️ Fallback truncation for {function_name}")
-                else:
-                    result_str = json.dumps(result, default=str)
                 
                 # Send result back to OpenAI
                 function_result = {

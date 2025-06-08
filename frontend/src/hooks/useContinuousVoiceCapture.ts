@@ -80,16 +80,16 @@ export const useContinuousVoiceCapture = ({
   const useWorkletRef = useRef(false)
   const lastSendTimeRef = useRef<number>(0)
   
-  // Enhanced wake word detection (works better on HTTP)
-  const wakeWordDetectionRef = useRef<{
-    enabled: boolean
-    confidence: number
-    lastDetection: number
-  }>({
-    enabled: false,
-    confidence: 0,
-    lastDetection: 0
-  })
+  // Enhanced wake word detection (works better on HTTP) - currently unused
+  // const wakeWordDetectionRef = useRef<{
+  //   enabled: boolean
+  //   confidence: number
+  //   lastDetection: number
+  // }>({
+  //   enabled: false,
+  //   confidence: 0,
+  //   lastDetection: 0
+  // })
   
   // Check browser support including AudioWorklet
   const checkSupport = useCallback(() => {

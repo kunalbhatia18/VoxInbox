@@ -1,0 +1,237 @@
+import { useState, useEffect, createContext, useContext, ReactNode } from 'react'
+
+interface AuthContextType {
+  isAuthenticated: boolean
+  token: string | null
+  user: { id: string; email: string } | null
+  login: (token: string) => void
+  logout: () => void
+  loading: boolean
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined)
+
+// Custom hook to use auth context
+export const useAuth = () => {
+  const context = useContext(AuthContext)
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider')
+  }
+  return context
+}
+
+// JWT token utilities
+const JWT_TOKEN_KEY = 'voxinbox_auth_token'
+
+const parseJWT = (token: string) => {
+  try {
+    const base64Url = token.split('.')[1]
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    )
+    return JSON.parse(jsonPayload)
+  } catch (error) {
+    console.error('Error parsing JWT:', error)
+    return null
+  }
+}
+
+const isTokenExpired = (token: string) => {
+  const payload = parseJWT(token)
+  if (!payload || !payload.exp) return true
+  
+  const currentTime = Math.floor(Date.now() / 1000)
+  return payload.exp < currentTime
+}
+
+// Auth Provider Component
+interface AuthProviderProps {
+  children: ReactNode
+}
+
+export const AuthProvider = ({ children }: AuthProviderProps) => {
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [token, setToken] = useState<string | null>(null)
+  const [user, setUser] = useState<{ id: string; email: string } | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  // Check for token in localStorage on mount
+  useEffect(() => {
+    console.log('🔐 AuthProvider: Checking for existing token...')
+    
+    // First check if there's a token in the URL fragment (from OAuth redirect)
+    const urlToken = extractTokenFromURL()
+    if (urlToken) {
+      console.log('🎯 Found token in URL, storing and cleaning URL')
+      login(urlToken)
+      // Clean the URL by removing the token fragment
+      window.history.replaceState({}, document.title, window.location.pathname)
+      return
+    }
+    
+    // Check localStorage for existing token
+    const storedToken = localStorage.getItem(JWT_TOKEN_KEY)
+    if (storedToken) {
+      console.log('📱 Found stored token, validating...')
+      
+      if (isTokenExpired(storedToken)) {
+        console.log('⏰ Token expired, removing')
+        localStorage.removeItem(JWT_TOKEN_KEY)
+        setLoading(false)
+        return
+      }
+      
+      // Token is valid, set auth state
+      const payload = parseJWT(storedToken)
+      if (payload) {
+        console.log('✅ Token valid, authenticating user:', payload.email)
+        setToken(storedToken)
+        setUser({ id: payload.user_id, email: payload.email })
+        setIsAuthenticated(true)
+      } else {
+        console.log('❌ Invalid token, removing')
+        localStorage.removeItem(JWT_TOKEN_KEY)
+      }
+    } else {
+      console.log('📝 No stored token found')
+    }
+    
+    setLoading(false)
+  }, [])
+
+  // Extract token from URL fragment (after OAuth redirect)
+  const extractTokenFromURL = (): string | null => {
+    const fragment = window.location.hash.substring(1) // Remove #
+    const params = new URLSearchParams(fragment)
+    return params.get('token')
+  }
+
+  // Login function - stores token and sets auth state
+  const login = (newToken: string) => {
+    console.log('🔑 Logging in with JWT token')
+    
+    // Validate token format
+    if (!newToken || !newToken.includes('.')) {
+      console.error('❌ Invalid token format')
+      return
+    }
+    
+    // Check if token is expired
+    if (isTokenExpired(newToken)) {
+      console.error('❌ Token is expired')
+      return
+    }
+    
+    // Parse user info from token
+    const payload = parseJWT(newToken)
+    if (!payload || !payload.user_id || !payload.email) {
+      console.error('❌ Invalid token payload')
+      return
+    }
+    
+    // Store token and set auth state
+    localStorage.setItem(JWT_TOKEN_KEY, newToken)
+    setToken(newToken)
+    setUser({ id: payload.user_id, email: payload.email })
+    setIsAuthenticated(true)
+    setLoading(false)
+    
+    console.log('✅ Authentication successful:', payload.email)
+  }
+
+  // Logout function - clears token and auth state
+  const logout = async () => {
+    console.log('🚪 Logging out...')
+    
+    // Call backend logout if we have a token
+    if (token) {
+      try {
+        const apiBaseUrl = getApiBaseUrl()
+        await fetch(`${apiBaseUrl}/auth/logout`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        })
+      } catch (error) {
+        console.warn('Logout API call failed:', error)
+      }
+    }
+    
+    // Clear local state
+    localStorage.removeItem(JWT_TOKEN_KEY)
+    setToken(null)
+    setUser(null)
+    setIsAuthenticated(false)
+    
+    console.log('✅ Logout complete')
+  }
+
+  // Helper function to get API base URL
+  const getApiBaseUrl = () => {
+    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+      return 'http://localhost:8000'
+    }
+    return 'https://voxinbox-backend-631500803172.us-central1.run.app'
+  }
+
+  const contextValue: AuthContextType = {
+    isAuthenticated,
+    token,
+    user,
+    login,
+    logout,
+    loading
+  }
+
+  return (
+    <AuthContext.Provider value={contextValue}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+// Helper hook for API calls with authentication
+export const useAuthenticatedFetch = () => {
+  const { token } = useAuth()
+
+  const authenticatedFetch = async (url: string, options: RequestInit = {}) => {
+    if (!token) {
+      throw new Error('No authentication token available')
+    }
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+      ...options.headers
+    }
+
+    return fetch(url, {
+      ...options,
+      headers
+    })
+  }
+
+  return authenticatedFetch
+}
+
+// Helper to get API base URL
+export const getApiBaseUrl = () => {
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    return 'http://localhost:8000'
+  }
+  return 'https://voxinbox-backend-631500803172.us-central1.run.app'
+}
+
+// Helper to get WebSocket URL with token
+export const getWebSocketUrl = (token: string) => {
+  const wsBase = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? 'ws://localhost:8000'
+    : 'wss://voxinbox-backend-631500803172.us-central1.run.app'
+  
+  return `${wsBase}/ws?token=${encodeURIComponent(token)}`
+}

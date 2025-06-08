@@ -1,13 +1,16 @@
 {
   "name": "voice-inbox-mvp",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "frontend"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "pnpm --filter frontend dev",
+    "build": "pnpm --filter frontend build"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "packageManager": "pnpm@10.11.0"
+  "devDependencies": {
+    "@types/node": "^22.15.23",
+    "gh-pages": "^6.3.0"
+  }
 }

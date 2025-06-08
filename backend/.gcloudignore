@@ -1,0 +1,36 @@
+# Ignore development files
+.env
+.env.local
+.env.development
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.DS_Store
+venv/
+.venv/
+env/
+ENV/
+
+# Ignore Git files
+.git/
+.gitignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore logs
+*.log
+
+# Ignore test files
+test/
+tests/
+*_test.py
+
+# Ignore documentation
+docs/
+README.md
